@@ -1,0 +1,97 @@
+*.env
+.env
+".env"
+# ─── Python ─────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+
+# virtual‐envs & env files
+env/
+venv/
+.venv/
+*.env
+
+# ─── OS / Editor ────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# IDE/project files
+.vscode/
+.idea/
+
+# ─── Node / Frontend ────────────────────────────────────
+services/frontend/node_modules/
+
+# ─── Logs ───────────────────────────────────────────────
+**/logs/
+*.log
+
+# ─── Redis & Databases ──────────────────────────────────
+data/redis/
+*.rdb
+*.sqlite
+*.sqlite3
+*.db
+
+# ─── Docker builds ──────────────────────────────────────
+# keep your Dockerfile(s) and compose yamls tracked,
+# but ignore any generated build dirs
+**/build/
+**/bin/
+**/obj/
+
+# ─── CMake / C++ ────────────────────────────────────────
+CMakeCache.txt
+CMakeFiles/
+Makefile
+
+# ─── Model artifacts ────────────────────────────────────
+# your scripts live in models/, but downloaded
+# binaries can get huge—ignore the folder wholesale
+models/
+
+# ─── Wheels ─────────────────────────────────────────────
+*.whl
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Build output
+dist/
+dist-ssr/
+bin/
+obj/
+
+# Local files
+*.local
+
+# Node modules
+node_modules/
+
+# Editor directories and files
+.vscode/
+!.vscode/extensions.json
+.idea/
+.vs/
+
+# macOS
+.DS_Store
+
+# Visual Studio temporary files, build results, and
+# user-specific files
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Environment variables
+*.env
+".env" 
+".env" 
