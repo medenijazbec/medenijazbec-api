@@ -18,6 +18,8 @@ namespace honey_badger_api.Entities
         public AppUser? OwnerUser { get; set; }
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
+        public string Kind { get; set; } = "software"; // "software" | "hardware"
+
 
         public ICollection<ProjectImage> Images { get; set; } = new List<ProjectImage>();
     }

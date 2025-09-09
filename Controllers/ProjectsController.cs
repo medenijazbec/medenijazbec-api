@@ -35,6 +35,7 @@ namespace honey_badger_api.Controllers
         {
             if (await _db.Projects.AnyAsync(p => p.Slug == dto.Slug))
                 return Conflict("Slug already exists");
+            // dto.Kind expected here
             _db.Projects.Add(dto);
             await _db.SaveChangesAsync();
             return CreatedAtAction(nameof(GetBySlug), new { slug = dto.Slug }, dto);
@@ -56,11 +57,12 @@ namespace honey_badger_api.Controllers
             entity.RepoUrl = dto.RepoUrl;
             entity.Featured = dto.Featured;
             entity.Published = dto.Published;
+            entity.Kind = dto.Kind; 
             entity.UpdatedAt = DateTime.UtcNow;
 
-            // replace images (simple approach)
             entity.Images.Clear();
-            foreach (var img in dto.Images) entity.Images.Add(new ProjectImage { Url = img.Url, Alt = img.Alt, SortOrder = img.SortOrder });
+            foreach (var img in dto.Images)
+                entity.Images.Add(new ProjectImage { Url = img.Url, Alt = img.Alt, SortOrder = img.SortOrder });
 
             await _db.SaveChangesAsync();
             return NoContent();
@@ -76,5 +78,21 @@ namespace honey_badger_api.Controllers
             await _db.SaveChangesAsync();
             return NoContent();
         }
+
+
+        [HttpGet]
+        public async Task<ActionResult<IEnumerable<Project>>> GetPublic(
+    [FromQuery] string? kind,
+    [FromQuery] bool includeUnpublished = false)
+        {
+            var q = _db.Projects.Include(p => p.Images).AsQueryable();
+            if (!string.IsNullOrWhiteSpace(kind)) q = q.Where(p => p.Kind == kind);
+            if (!includeUnpublished) q = q.Where(p => p.Published);
+            var items = await q.OrderByDescending(p => p.Featured)
+                               .ThenByDescending(p => p.UpdatedAt)
+                               .ToListAsync();
+            return Ok(items);
+        }
+
     }
 }

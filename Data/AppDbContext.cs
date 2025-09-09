@@ -46,6 +46,12 @@ namespace honey_badger_api.Data
             b.Entity<BlogPostTag>()
                 .HasKey(x => new { x.BlogPostId, x.BlogTagId });
 
+            //projects
+            b.Entity<Project>()
+  .HasIndex(p => p.Slug).IsUnique();
+            b.Entity<Project>()
+              .HasIndex(p => p.Kind);
+
             // Fitness
             b.Entity<FitnessDaily>()
                 .HasIndex(x => new { x.UserId, x.Day })
