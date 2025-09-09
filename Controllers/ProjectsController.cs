@@ -13,14 +13,6 @@ namespace honey_badger_api.Controllers
         private readonly AppDbContext _db;
         public ProjectsController(AppDbContext db) => _db = db;
 
-        [HttpGet]
-        public async Task<ActionResult<IEnumerable<Project>>> GetPublic([FromQuery] bool includeUnpublished = false)
-        {
-            var q = _db.Projects.Include(p => p.Images).AsQueryable();
-            if (!includeUnpublished) q = q.Where(p => p.Published);
-            var items = await q.OrderByDescending(p => p.Featured).ThenByDescending(p => p.UpdatedAt).ToListAsync();
-            return Ok(items);
-        }
 
         [HttpGet("{slug}")]
         public async Task<ActionResult<Project>> GetBySlug(string slug)
