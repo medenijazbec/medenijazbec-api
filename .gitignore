@@ -95,3 +95,5 @@ node_modules/
 *.env
 ".env" 
 ".env" 
+# Samsung Health data (large/sensitive)
+Samsung-Data/

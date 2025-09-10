@@ -10,6 +10,7 @@ using Microsoft.Extensions.FileProviders;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using System.Text;
+using Microsoft.AspNetCore.Http.Features;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1) Load .env (first), then build configuration
@@ -172,11 +173,43 @@ builder.Services.AddCors(opt =>
     });
 });
 
-var app = builder.Build();
+
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7) Static GLB models @ /models  (env: ANIMATIONS_GLB_DIR)
+// Samsung-Data paths (FIX: use builder.Environment; not 'app' yet)
 // ─────────────────────────────────────────────────────────────────────────────
+var defaultRoot = Path.Combine(builder.Environment.ContentRootPath, "Samsung-Data");
+var shealthRoot =
+    Environment.GetEnvironmentVariable("SAMSUNG_DATA_DIR")
+    ?? builder.Configuration["SAMSUNG_DATA_DIR"]
+    ?? defaultRoot;
+
+Directory.CreateDirectory(shealthRoot);
+Directory.CreateDirectory(Path.Combine(shealthRoot, "ZIP_FILES"));
+Directory.CreateDirectory(Path.Combine(shealthRoot, "RAW_DATA"));
+
+builder.Services.AddSingleton(new ShealthConfig
+{
+    RootDir = shealthRoot
+});
+// Allow large multipart/form uploads
+builder.Services.Configure<FormOptions>(o =>
+{
+    o.MultipartBodyLengthLimit = 1_500_000_000; // ~1.5GB
+    o.ValueLengthLimit = int.MaxValue;
+    o.MultipartHeadersLengthLimit = int.MaxValue;
+});
+
+// Also bump Kestrel body size (only matters if not behind IIS)
+builder.WebHost.ConfigureKestrel(o =>
+{
+    o.Limits.MaxRequestBodySize = 1_500_000_000;
+});
+
+
+var app = builder.Build();
+
+// 7) Static files + GLB models (unchanged except we now have 'app')
 var glbDir =
     Environment.GetEnvironmentVariable("ANIMATIONS_GLB_DIR")
     ?? builder.Configuration["ANIMATIONS_GLB_DIR"]

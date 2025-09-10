@@ -26,6 +26,10 @@
 	  <Folder Include="Hubs\" />
 	</ItemGroup>
 
-
+	<ItemGroup>
+	  <None Include="tools\**\*.*">
+		<CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	  </None>
+	</ItemGroup>
 
 </Project>
