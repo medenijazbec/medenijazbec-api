@@ -31,14 +31,33 @@ namespace honey_badger_api.Data
         {
             base.OnModelCreating(b);
 
-            // Projects
             b.Entity<Project>()
-                .HasIndex(p => p.Slug).IsUnique();
-            b.Entity<ProjectImage>()
-                .HasOne<Project>()
-                .WithMany(p => p.Images)
+                            .HasMany(p => p.Images)
+                            .WithOne()
+                            .HasForeignKey(pi => pi.ProjectId)
+                            .OnDelete(DeleteBehavior.Cascade);
+
+            b.Entity<Project>()
+                .HasMany(p => p.Images)
+                .WithOne()
                 .HasForeignKey(pi => pi.ProjectId)
                 .OnDelete(DeleteBehavior.Cascade);
+
+            b.Entity<Project>()
+                .HasIndex(p => p.Slug)
+                .IsUnique();
+
+            b.Entity<Project>()
+                .HasIndex(p => new { p.Kind, p.Published });
+
+            b.Entity<ProjectImage>()
+                .HasIndex(pi => new { pi.ProjectId, pi.SortOrder });
+
+            // Map property to existing MySQL JSON column "TechStack"
+            b.Entity<Project>()
+                .Property(p => p.TechStackJson)
+                .HasColumnName("TechStack")
+                .HasColumnType("json");
 
             // Blog
             b.Entity<BlogPost>()
@@ -46,11 +65,7 @@ namespace honey_badger_api.Data
             b.Entity<BlogPostTag>()
                 .HasKey(x => new { x.BlogPostId, x.BlogTagId });
 
-            //projects
-            b.Entity<Project>()
-  .HasIndex(p => p.Slug).IsUnique();
-            b.Entity<Project>()
-              .HasIndex(p => p.Kind);
+
 
             // Fitness
             b.Entity<FitnessDaily>()

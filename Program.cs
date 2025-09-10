@@ -184,6 +184,10 @@ var glbDir =
 
 app.Logger.LogInformation("GLB dir resolved to: {dir} (exists={exists})", glbDir, Directory.Exists(glbDir));
 
+var webRoot = app.Environment.WebRootPath ?? Path.Combine(Directory.GetCurrentDirectory(), "wwwroot");
+Directory.CreateDirectory(Path.Combine(webRoot, "images"));
+app.UseStaticFiles();
+
 if (Directory.Exists(glbDir))
 {
     app.UseStaticFiles(new StaticFileOptions

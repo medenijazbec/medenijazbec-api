@@ -1,26 +1,29 @@
 ﻿using honey_badger_api.Data;
+using System.ComponentModel.DataAnnotations.Schema;
 
 namespace honey_badger_api.Entities
 {
     public class Project
     {
         public long Id { get; set; }
-        public string Slug { get; set; } = default!;
-        public string Title { get; set; } = default!;
+        public string Slug { get; set; } = "";
+        public string Title { get; set; } = "";
         public string? Summary { get; set; }
         public string? Description { get; set; }
-        public string? TechStackJson { get; set; } // Map JSON from DB
+
+        // Store JSON (array of { name, iconUrl? }) in DB column "TechStack"
+        [Column("TechStack", TypeName = "json")]
+        public string? TechStackJson { get; set; }
+
         public string? LiveUrl { get; set; }
         public string? RepoUrl { get; set; }
         public bool Featured { get; set; }
-        public bool Published { get; set; } = true;
+        public bool Published { get; set; }
         public string? OwnerUserId { get; set; }
-        public AppUser? OwnerUser { get; set; }
-        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
-        public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;
-        public string Kind { get; set; } = "software"; // "software" | "hardware"
+        public DateTime CreatedAt { get; set; }
+        public DateTime UpdatedAt { get; set; }
+        public string Kind { get; set; } = "software";
 
-
-        public ICollection<ProjectImage> Images { get; set; } = new List<ProjectImage>();
+        public List<ProjectImage> Images { get; set; } = new();
     }
 }
