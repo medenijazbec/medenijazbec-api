@@ -1,5 +1,6 @@
 ﻿// path: honey_badger_api/Controllers/AuthController.cs
 using honey_badger_api.Data;
+using honey_badger_api.Entities;
 using honey_badger_api.Security;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Identity;
@@ -15,17 +16,20 @@ namespace honey_badger_api.Controllers
         private readonly SignInManager<AppUser> _signInManager;
         private readonly RoleManager<IdentityRole> _roleManager;
         private readonly IConfiguration _cfg;
+        private readonly AppDbContext _db;
 
         public AuthController(
             UserManager<AppUser> userManager,
             SignInManager<AppUser> signInManager,
             RoleManager<IdentityRole> roleManager,
-            IConfiguration cfg)
+            IConfiguration cfg,
+            AppDbContext db) // <-- inject
         {
             _userManager = userManager;
             _signInManager = signInManager;
             _roleManager = roleManager;
             _cfg = cfg;
+            _db = db; // <-- store
         }
 
         // POST /api/auth/register  { email, password, displayName? }
@@ -68,6 +72,25 @@ namespace honey_badger_api.Controllers
             if (!check.Succeeded) return Unauthorized("Invalid email or password.");
 
             var roles = await _userManager.GetRolesAsync(user);
+
+            // --- Record login session (NEW) ---
+            var ip = HttpContext.Connection.RemoteIpAddress?.ToString()
+                     ?? Request.Headers["X-Forwarded-For"].ToString().Split(',').FirstOrDefault()
+                     ?? "0.0.0.0";
+            var ua = Request.Headers.UserAgent.ToString();
+
+            _db.LoginSessions.Add(new LoginSession
+            {
+                UserId = user.Id,
+                Email = user.Email ?? "",
+                Ip = ip,
+                UserAgent = ua,
+                CreatedUtc = DateTime.UtcNow,
+                LastSeenUtc = DateTime.UtcNow
+            });
+            await _db.SaveChangesAsync();
+            // ----------------------------------
+
             var jwt = JwtTokenGeneration.Create(user, roles, _cfg);
 
             return Ok(new
@@ -78,6 +101,7 @@ namespace honey_badger_api.Controllers
                 user = new { id = user.Id, email = user.Email }
             });
         }
+
 
         // GET /api/auth/me
         [Authorize]

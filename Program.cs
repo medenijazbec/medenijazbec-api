@@ -206,7 +206,7 @@ builder.WebHost.ConfigureKestrel(o =>
     o.Limits.MaxRequestBodySize = 1_500_000_000;
 });
 
-
+builder.Services.AddHostedService<honey_badger_api.Services.TelemetryRollupService>();
 var app = builder.Build();
 
 // 7) Static files + GLB models (unchanged except we now have 'app')
@@ -234,6 +234,8 @@ if (Directory.Exists(glbDir))
         }
     });
 }
+app.UseMiddleware<honey_badger_api.Middleware.RequestLoggingMiddleware>();
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 8) Pipeline

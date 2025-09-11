@@ -25,11 +25,40 @@ namespace honey_badger_api.Data
         public DbSet<ContactInquiry> ContactInquiries => Set<ContactInquiry>();
         public DbSet<AnimationGroup> AnimationGroups => Set<AnimationGroup>();
         public DbSet<AnimationGroupItem> AnimationGroupItems => Set<AnimationGroupItem>();
-
+        public DbSet<RequestLog> RequestLogs => Set<RequestLog>();
+        public DbSet<DailyTopIp> DailyTopIps => Set<DailyTopIp>();
+        public DbSet<LoginSession> LoginSessions => Set<LoginSession>();
+        public DbSet<IpBan> IpBans => Set<IpBan>();
+        public DbSet<MetricSnapshot> MetricSnapshots => Set<MetricSnapshot>();
 
         protected override void OnModelCreating(ModelBuilder b)
         {
             base.OnModelCreating(b);
+
+            b.Entity<RequestLog>()
+       .HasIndex(x => x.StartedUtc);
+            b.Entity<RequestLog>()
+                .HasIndex(x => new { x.Path, x.StartedUtc });
+            b.Entity<RequestLog>()
+                .HasIndex(x => new { x.Ip, x.StartedUtc });
+            b.Entity<RequestLog>()
+                .HasIndex(x => x.StatusCode);
+
+            b.Entity<DailyTopIp>()
+                .HasIndex(x => new { x.Day, x.Rank }).IsUnique();
+            b.Entity<DailyTopIp>()
+                .HasIndex(x => new { x.Day, x.Ip });
+
+            b.Entity<LoginSession>()
+                .HasIndex(x => new { x.UserId, x.CreatedUtc });
+            b.Entity<LoginSession>()
+                .HasIndex(x => x.Email);
+
+            b.Entity<IpBan>()
+                .HasIndex(x => new { x.Kind, x.Value });
+
+            b.Entity<MetricSnapshot>()
+                .HasIndex(x => x.WindowStartUtc);
 
             b.Entity<Project>()
                             .HasMany(p => p.Images)
