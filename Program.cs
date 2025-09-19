@@ -163,15 +163,25 @@ builder.Services.AddCors(opt =>
 {
     opt.AddPolicy("spa", p =>
     {
-        if (corsOrigins.Length > 0)
-            p.WithOrigins(corsOrigins).AllowCredentials();
-        else
-            p.AllowAnyOrigin(); // dev-friendly fallback (no credentials)
+        // Strict allow-list for dev
+        var origins = corsOrigins.Length > 0
+            ? corsOrigins
+            : new[]
+            {
+                "http://localhost:5174",
+                "https://localhost:5174",
+                "http://127.0.0.1:5174",
+                "http://localhost:5173",
+                "https://localhost:5173"
+            };
 
-        p.AllowAnyHeader()
-         .AllowAnyMethod();
+        p.WithOrigins(origins)
+         .AllowAnyHeader()
+         .AllowAnyMethod()
+         .AllowCredentials(); // only safe because we aren’t using AllowAnyOrigin
     });
 });
+
 
 
 

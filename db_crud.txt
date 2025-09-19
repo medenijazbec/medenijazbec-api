@@ -7,31 +7,6 @@ CREATE DATABASE IF NOT EXISTS `honeybadgerdb`
 USE `honeybadgerdb`;
 
 SET NAMES utf8mb4;
-SET FOREIGN_KEY_CHECKS = 0;
-
--- ─────────────────────────────────────────────────────────────────────────────
--- Drop existing objects (children first)
--- ─────────────────────────────────────────────────────────────────────────────
-DROP VIEW IF EXISTS `v_user_is_admin`;
-
-DROP TABLE IF EXISTS `ProjectImages`;
-DROP TABLE IF EXISTS `BlogPostTags`;
-DROP TABLE IF EXISTS `BlogTags`;
-DROP TABLE IF EXISTS `Projects`;
-DROP TABLE IF EXISTS `BlogPosts`;
-DROP TABLE IF EXISTS `FitnessDaily`;
-DROP TABLE IF EXISTS `ExerciseSessions`;
-DROP TABLE IF EXISTS `ContactInquiries`;
-
-DROP TABLE IF EXISTS `AspNetUserTokens`;
-DROP TABLE IF EXISTS `AspNetUserLogins`;
-DROP TABLE IF EXISTS `AspNetUserRoles`;
-DROP TABLE IF EXISTS `AspNetUserClaims`;
-DROP TABLE IF EXISTS `AspNetRoleClaims`;
-DROP TABLE IF EXISTS `AspNetUsers`;
-DROP TABLE IF EXISTS `AspNetRoles`;
-
-SET FOREIGN_KEY_CHECKS = 1;
 
 -- ─────────────────────────────────────────────────────────────────────────────
 -- ASP.NET Core Identity (MySQL-friendly)
@@ -395,3 +370,195 @@ WHERE @uid IS NOT NULL AND @rid IS NOT NULL;
 
 -- verify
 SELECT * FROM v_user_is_admin WHERE UserId = @uid;
+
+ALTER TABLE `FitnessDaily`
+  ADD COLUMN `DistanceKm` DECIMAL(6,2) NULL AFTER `Steps`;
+
+select * from aspnetusers;
+
+
+CREATE TABLE IF NOT EXISTS `RequestLogs` (
+  `Id` BIGINT NOT NULL AUTO_INCREMENT,
+  `StartedUtc` DATETIME(6) NOT NULL,
+  `DurationMs` INT NOT NULL,
+  `Method` VARCHAR(16) NOT NULL,
+  `Path` VARCHAR(1024) NOT NULL,
+  `Query` LONGTEXT NULL,
+  `StatusCode` INT NOT NULL,
+  `UserId` VARCHAR(255) NULL,
+  `Email` VARCHAR(256) NULL,
+  `Ip` VARCHAR(64) NOT NULL,
+  `Country` VARCHAR(64) NULL,
+  `Asn` VARCHAR(32) NULL,
+  `UserAgent` VARCHAR(1024) NULL,
+  `UaFamily` VARCHAR(64) NULL,
+  `IsBot` TINYINT(1) NOT NULL DEFAULT 0,
+  `Referrer` VARCHAR(1024) NULL,
+  `Protocol` VARCHAR(16) NULL,
+  `TlsProtocol` VARCHAR(32) NULL,
+  `TlsCipher` VARCHAR(64) NULL,
+  `ResponseBytes` BIGINT NULL,
+  `Blocked` TINYINT(1) NOT NULL DEFAULT 0,
+  `BlockReason` VARCHAR(100) NULL,
+  `WafFlagsJson` LONGTEXT NULL,
+  `ExtraJson` LONGTEXT NULL,
+  PRIMARY KEY (`Id`),
+  KEY `IX_RequestLogs_StartedUtc` (`StartedUtc`),
+  /* ↓ Use a prefix index on Path to stay within byte limits */
+  KEY `IX_RequestLogs_Path_StartedUtc` (`Path`(191), `StartedUtc`),
+  KEY `IX_RequestLogs_Ip_StartedUtc` (`Ip`, `StartedUtc`),
+  KEY `IX_RequestLogs_StatusCode` (`StatusCode`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+
+CREATE TABLE IF NOT EXISTS `DailyTopIps` (
+  `Id` BIGINT NOT NULL AUTO_INCREMENT,
+  `Day` DATE NOT NULL,
+  `Ip` VARCHAR(64) NOT NULL,
+  `Count` INT NOT NULL,
+  `Rank` INT NOT NULL,
+  `Country` VARCHAR(64) NULL,
+  `Asn` VARCHAR(32) NULL,
+  `CreatedUtc` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (`Id`),
+  UNIQUE KEY `UX_DailyTopIps_Day_Rank` (`Day`, `Rank`),
+  KEY `IX_DailyTopIps_Day_Ip` (`Day`, `Ip`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `LoginSessions` (
+  `Id` BIGINT NOT NULL AUTO_INCREMENT,
+  `UserId` VARCHAR(255) NOT NULL,
+  `Email` VARCHAR(256) NULL,
+  `Ip` VARCHAR(64) NOT NULL,
+  `UserAgent` VARCHAR(512) NULL,
+  `CreatedUtc` DATETIME(6) NOT NULL,
+  `LastSeenUtc` DATETIME(6) NOT NULL,
+  `JwtId` VARCHAR(64) NULL,
+  `Revoked` TINYINT(1) NOT NULL DEFAULT 0,
+  `RevokedUtc` DATETIME(6) NULL,
+  PRIMARY KEY (`Id`),
+  KEY `IX_LoginSessions_UserId_CreatedUtc` (`UserId`, `CreatedUtc`),
+  KEY `IX_LoginSessions_Email` (`Email`),
+  CONSTRAINT `FK_LoginSessions_AspNetUsers`
+    FOREIGN KEY (`UserId`) REFERENCES `AspNetUsers`(`Id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `IpBans` (
+  `Id` BIGINT NOT NULL AUTO_INCREMENT,
+  `Value` VARCHAR(255) NOT NULL,      -- IP or CIDR
+  `Kind` VARCHAR(32) NOT NULL DEFAULT 'ip', -- ip|cidr|user|asn|country
+  `Reason` VARCHAR(500) NULL,
+  `CreatedUtc` DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  `ExpiresUtc` DATETIME(6) NULL,
+  `Disabled` TINYINT(1) NOT NULL DEFAULT 0,
+  `CreatedByUserId` VARCHAR(255) NULL,
+  PRIMARY KEY (`Id`),
+  KEY `IX_IpBans_Kind_Value` (`Kind`, `Value`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+CREATE TABLE IF NOT EXISTS `MetricSnapshots` (
+  `Id` BIGINT NOT NULL AUTO_INCREMENT,
+  `WindowStartUtc` DATETIME(6) NOT NULL,
+  `WindowEndUtc` DATETIME(6) NOT NULL,
+  `Requests` INT NOT NULL,
+  `P50Ms` DOUBLE NOT NULL,
+  `P95Ms` DOUBLE NOT NULL,
+  `P99Ms` DOUBLE NOT NULL,
+  `UniqueIps` INT NOT NULL,
+  `Errors4xx` INT NOT NULL,
+  `Errors5xx` INT NOT NULL,
+  `StatusCountsJson` LONGTEXT NULL,
+  `CountrySplitJson` LONGTEXT NULL,
+  `UaBotHistogramJson` LONGTEXT NULL,
+  `Notes` LONGTEXT NULL,
+  PRIMARY KEY (`Id`),
+  KEY `IX_MetricSnapshots_WindowStartUtc` (`WindowStartUtc`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+SELECT COUNT(*) FROM FitnessDaily WHERE UserId = ':uid';
+
+delete from fitnessdaily;
+
+select * from fitnessdaily where steps = 4521;
+select count(*)  from fitnessdaily where IsSynthetic = 1;
+select count(*)  from fitnessdaily where IsSynthetic = 0;
+
+
+select * from fitnessdaily where steps < 1000;
+select * from fitnessdaily;
+select * from aspnetusers;
+
+
+/* ─────────────────────────────────────────────────────────────────────────────
+   FitnessDaily triggers: boost low steps and keep DistanceKm in sync
+   Rule: if Steps < 3000 (or NULL), add 6000 + random(1000..2000)
+         DistanceKm := ROUND(Steps * 0.0007495, 2)
+   ───────────────────────────────────────────────────────────────────────────── */
+
+-- Clean up any older trigger names you may have used previously
+DROP TRIGGER IF EXISTS fitnessdaily_after_insert_boost;
+DROP TRIGGER IF EXISTS tr_fitnessdaily_boost_steps_bi;
+DROP TRIGGER IF EXISTS tr_fitnessdaily_boost_steps_bu;
+
+DELIMITER $$
+
+-- BEFORE INSERT: boost low steps and compute DistanceKm via polynomial
+DROP TRIGGER IF EXISTS tr_fitnessdaily_boost_steps_bi $$
+CREATE TRIGGER tr_fitnessdaily_boost_steps_bi
+BEFORE INSERT ON FitnessDaily
+FOR EACH ROW
+BEGIN
+  DECLARE base_steps INT DEFAULT IFNULL(NEW.Steps, 0);
+  DECLARE add_total  INT;
+  DECLARE km DOUBLE;
+
+  IF base_steps < 3000 THEN
+    -- 6000 + random(1000..2000)
+    SET add_total = 6000 + FLOOR(1000 + (RAND() * 1001));
+    SET NEW.Steps = base_steps + add_total;
+  END IF;
+
+  -- DistanceKm using personalized quadratic:
+  -- km = 0.129091492 + 0.000589979242 * steps + 2.45535812e-08 * steps^2
+  IF NEW.Steps IS NULL THEN
+    SET NEW.DistanceKm = NULL;
+  ELSE
+    SET km = 0.129091492
+             + 0.000589979242 * NEW.Steps
+             + 0.0000000245535812 * NEW.Steps * NEW.Steps;
+    SET NEW.DistanceKm = ROUND(GREATEST(0, km), 2);
+  END IF;
+END$$
+
+
+-- BEFORE UPDATE: enforce the same rule; guard against double-boosting
+DROP TRIGGER IF EXISTS tr_fitnessdaily_boost_steps_bu $$
+CREATE TRIGGER tr_fitnessdaily_boost_steps_bu
+BEFORE UPDATE ON FitnessDaily
+FOR EACH ROW
+BEGIN
+  DECLARE base_steps INT DEFAULT IFNULL(NEW.Steps, 0);
+  DECLARE add_total  INT;
+  DECLARE km DOUBLE;
+
+  -- Only boost if still <3000 and the caller didn't already change it this turn
+  IF base_steps < 3000 AND (OLD.Steps IS NULL OR NEW.Steps = OLD.Steps) THEN
+    SET add_total = 6000 + FLOOR(1000 + (RAND() * 1001));
+    SET NEW.Steps = base_steps + add_total;
+  END IF;
+
+  -- Recompute DistanceKm from final NEW.Steps via the polynomial
+  IF NEW.Steps IS NULL THEN
+    SET NEW.DistanceKm = NULL;
+  ELSE
+    SET km = 0.129091492
+             + 0.000589979242 * NEW.Steps
+             + 0.0000000245535812 * NEW.Steps * NEW.Steps;
+    SET NEW.DistanceKm = ROUND(GREATEST(0, km), 2);
+  END IF;
+END$$
+
+DELIMITER ;
+
+-- Optional quick checks:
+-- SHOW TRIGGERS LIKE 'FitnessDaily';

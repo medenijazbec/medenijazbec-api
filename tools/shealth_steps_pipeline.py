@@ -1,223 +1,395 @@
-import os
+﻿import os
 import json
 import csv
 from glob import glob
 from datetime import datetime, timedelta, timezone
-import sys
 
-# ---- Config ----
-STEP_TO_KM = (0.0007376 + 0.0007614) / 2  # 0.0007495
-REFERENCE_STEPS = [
-    {"date": "2024-02-12", "steps": 6822},
-    {"date": "2024-02-13", "steps": 4521},
-    {"date": "2024-02-14", "steps": 1010},
-]
+# -------------------- CONFIG --------------------
+
+# Personalized steps→km fit (based on Samsung Health samples).
+# km = A + B*steps + C*steps^2  (clamped to ≥ 0)
+PERSONAL_STEPS_TO_KM_COEFFS = (0.129091492, 0.000589979242, 2.45535812e-08)
+
+def steps_to_km(steps: float) -> float:
+    a, b, c = PERSONAL_STEPS_TO_KM_COEFFS
+    y = a + b * steps + c * (steps ** 2)
+    return max(0.0, y)
+
+# (Optional) keep the legacy constant for reference/fallback
+STEP_TO_KM_LEGACY = (0.0007376 + 0.0007614) / 2  # ≈ 0.0007495
+
 BAD_DATE = "1970-01-01"
 
-# Resolve BASE_DIR from env or CLI
-BASE_DIR = os.environ.get("SHEALTH_DIR")
-if not BASE_DIR and len(sys.argv) > 1:
-    BASE_DIR = sys.argv[1]
-if not BASE_DIR:
-    raise SystemExit("Usage: shealth_steps_pipeline.py <BASE_DIR> or set SHEALTH_DIR")
+# Always read paths from environment (with safe defaults)
+RAW_DATA_ROOT = os.environ.get(
+    "SHEALTH_RAW_DATA",
+    r"C:\Users\matic\Desktop\honeybadger_crt\honey_badger_api\Samsung-Data\RAW_DATA"
+)
 
-# ---- Helpers (unchanged logic) ----
+OUTPUT_DIR = os.environ.get(
+    "SHEALTH_OUTPUT_DIR",
+    RAW_DATA_ROOT  # default: write CSV next to RAW_DATA
+)
+
+# Three rock-solid clusters (triplets) — ISO format dates
+CLUSTERS = [
+    {"start_date": "2021-12-14", "steps_seq": [4702, 6105, 10453]},  # 2021-12-14..16
+    {"start_date": "2023-05-16", "steps_seq": [2470, 9953, 5412]},   # 2023-05-16..18
+    {"start_date": "2025-09-15", "steps_seq": [4964, 1247, 2865]},   # 2025-09-15..17
+]
+
+# Calendar strictly spans the cluster range (inclusive)
+CAL_START = datetime.strptime(min(c["start_date"] for c in CLUSTERS), "%Y-%m-%d")
+CAL_END = max(
+    datetime.strptime(c["start_date"], "%Y-%m-%d") + timedelta(days=2)
+    for c in CLUSTERS
+)
+
+# -------------------- HELPERS --------------------
+
 def ms_to_date(ms):
     return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime('%Y-%m-%d')
 
-def get_all_binning_files(base_dir):
-    files = []
-    for root, dirs, _ in os.walk(base_dir):
-        for d in dirs:
-            dir_path = os.path.join(root, d)
-            files.extend(glob(os.path.join(dir_path, "*.binning_data.json")))
-    return sorted(files)
-
-def extract_date_from_entry(entry):
-    if "mBestStepsDate" in entry: return ms_to_date(entry["mBestStepsDate"])
-    if "mStartTime" in entry:     return ms_to_date(entry["mStartTime"])
-    if "start_time" in entry:     return ms_to_date(entry["start_time"])
+def try_parse_date_like(x):
+    """Try to convert a variety of fields (ms epoch or iso string) to yyyy-mm-dd or None."""
+    if x is None:
+        return None
+    try:
+        if isinstance(x, (int, float)):
+            if x > 10_000_000_000:  # interpret as ms
+                return ms_to_date(x)
+            return datetime.fromtimestamp(x, tz=timezone.utc).strftime('%Y-%m-%d')
+        if isinstance(x, str):
+            try:
+                return datetime.fromisoformat(x.replace('Z', '').split('T')[0]).strftime('%Y-%m-%d')
+            except Exception:
+                pass
+            if x.isdigit():
+                val = int(x)
+                return ms_to_date(val if val > 10_000_000_000 else val * 1000)
+    except Exception:
+        return None
     return None
 
-def process_file(filepath):
-    with open(filepath, encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except Exception as e:
-            print(f"Failed to read {filepath}: {e}")
-            return None, None, None
+def extract_date_from_entry(entry):
+    for k in ("mBestStepsDate", "mStartTime", "start_time", "day_time", "time", "date", "day_start"):
+        if k in entry:
+            ds = try_parse_date_like(entry[k])
+            if ds:
+                return ds
+    return None
 
+def find_all_pedometer_dirs(raw_root):
+    """Find every .../jsons/com.samsung.shealth.tracker.pedometer_day_summary directory under RAW_DATA."""
+    pattern = os.path.join(
+        raw_root,
+        "**",
+        "jsons",
+        "com.samsung.shealth.tracker.pedometer_day_summary"
+    )
+    dirs = [d for d in glob(pattern, recursive=True) if os.path.isdir(d)]
+    dirs.sort()
+    return dirs
+
+def find_all_binning_files_in_dir(pedo_dir):
+    """Return ALL *.binning_data.json found recursively under pedo_dir (covers 0..f)."""
+    pattern = os.path.join(pedo_dir, "**", "*.binning_data.json")
+    files = glob(pattern, recursive=True)
+    files.sort(key=lambda p: (os.path.getmtime(p), p))  # stable ordering
+    return files
+
+# -------------------- EXTRACTION --------------------
+
+def _accumulate_from_iterable(items):
+    """Accumulate steps/distance from a list of 'bin' entries with various schemas."""
     total_steps = 0
     total_distance = 0.0
     found_distance = False
-    key_style = None
     found_date = None
 
-    if isinstance(data, list) and data:
-        for entry in data:
-            if not isinstance(entry, dict): continue
-            if not found_date: found_date = extract_date_from_entry(entry)
-            if "count" in entry:       key_style = "shealth";   break
-            if "mStepCount" in entry:  key_style = "pedometer"; break
-        if not key_style: return None, None, None
-        for entry in data:
-            if not isinstance(entry, dict): continue
-            if key_style == "shealth":
-                steps = entry.get("count", 0)
-                distance = entry.get("distance", 0.0)
-            else:  # pedometer
-                steps = entry.get("mStepCount", 0)
-                distance = entry.get("mDistance", 0.0)
+    for entry in items:
+        if not isinstance(entry, dict):
+            continue
 
-            if steps and steps > 0: total_steps += steps
-            if distance and distance > 0:
-                total_distance += distance
-                found_distance = True
-            if not found_date: found_date = extract_date_from_entry(entry)
+        # steps candidates
+        steps_val = None
+        for sk in ("mStepCount", "mBestSteps", "count", "steps", "value"):
+            if sk in entry and isinstance(entry[sk], (int, float)) and entry[sk] > 0:
+                steps_val = int(entry[sk])
+                break
+
+        # distance candidates (meters)
+        dist_val = None
+        for dk in ("mDistance", "distance"):
+            if dk in entry and isinstance(entry[dk], (int, float)) and entry[dk] > 0:
+                dist_val = float(entry[dk])
+                break
+
+        if steps_val:
+            total_steps += steps_val
+        if dist_val:
+            total_distance += dist_val
+            found_distance = True
+
+        if not found_date:
+            found_date = extract_date_from_entry(entry)
+
+    if total_steps == 0 and not found_distance:
+        return None
+
+    distance_km = (total_distance / 1000.0) if (found_distance and total_distance > 0) else steps_to_km(total_steps)
+    return {
+        "steps": int(total_steps),
+        "distance_km": round(distance_km, 2),
+        "raw_date": found_date,
+    }
+
+def process_binning_json(filepath):
+    """
+    Robustly parse a ∗.binning_data.json that may be:
+      - list of bins
+      - dict with 'binning_data' / 'items' / 'data' lists
+      - single-object pedometer aggregate
+    Returns dict with steps, distance_km, raw_date, mtime; or None if empty.
+    """
+    try:
+        with open(filepath, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        print(f"[READ FAIL] {filepath}: {e}")
+        return None
+
+    result = None
+
+    if isinstance(data, list):
+        result = _accumulate_from_iterable(data)
 
     elif isinstance(data, dict):
-        if "mBestSteps" in data and "mBestStepsDate" in data:
-            key_style = "pedometer"
-            total_steps = data.get("mBestSteps", 0)
-            found_date = extract_date_from_entry(data)
-        elif "count" in data and "start_time" in data:
-            key_style = "shealth"
-            total_steps = data.get("count", 0)
-            found_date = extract_date_from_entry(data)
-        else:
-            return None, None, None
+        # containers with lists
+        for container_key in ("binning_data", "items", "data"):
+            if container_key in data and isinstance(data[container_key], list):
+                result = _accumulate_from_iterable(data[container_key])
+                break
 
-    if total_steps == 0: return None, None, None
+        # single-object fallback
+        if result is None:
+            steps = 0
+            for sk in ("mBestSteps", "mStepCount", "count", "steps", "value"):
+                if sk in data and isinstance(data[sk], (int, float)) and data[sk] > 0:
+                    steps += int(data[sk])
+            total_distance = 0.0
+            found_distance = False
+            for dk in ("mDistance", "distance"):
+                if dk in data and isinstance(data[dk], (int, float)) and data[dk] > 0:
+                    total_distance += float(data[dk])
+                    found_distance = True
+            if steps > 0 or found_distance:
+                rd = extract_date_from_entry(data)
+                distance_km = (total_distance / 1000.0) if (found_distance and total_distance > 0) else steps_to_km(steps)
+                result = {
+                    "steps": int(steps),
+                    "distance_km": round(distance_km, 2),
+                    "raw_date": rd,
+                }
 
-    result = {
-        "steps": total_steps,
-        "distance_km": round((total_distance / 1000.0) if found_distance and total_distance > 0 else total_steps * STEP_TO_KM, 2),
+    if not result:
+        return None
+
+    result.update({
         "file": filepath,
         "mtime": os.path.getmtime(filepath),
-        "date": found_date
-    }
-    return key_style, result, found_distance
+    })
+    return result
 
-def assign_dates(files_info, reference_steps):
-    with_dates = [f for f in files_info if f.get("date")]
-    without_dates = [f for f in files_info if not f.get("date")]
-    if not without_dates: return files_info
-    files_info.sort(key=lambda x: x["mtime"])
-    steps_to_idx = {f["steps"]: idx for idx, f in enumerate(files_info)}
-    ref_dates_idx = []
-    for ref in reference_steps:
-        idx = steps_to_idx.get(ref["steps"])
-        if idx is not None: ref_dates_idx.append({"date": ref["date"], "idx": idx})
-    if len(ref_dates_idx) < 1:
-        base_date = datetime.strptime(reference_steps[0]["date"], "%Y-%m-%d")
-        return [{**f, "date": (base_date + timedelta(days=i)).strftime("%Y-%m-%d")} for i, f in enumerate(files_info)]
-    date_map = {}
-    for i in range(len(ref_dates_idx)):
-        ref = ref_dates_idx[i]
-        date0 = datetime.strptime(ref["date"], "%Y-%m-%d")
-        idx0 = ref["idx"]
-        date_map[idx0] = date0
-        next_idx = ref_dates_idx[i+1]["idx"] if i+1 < len(ref_dates_idx) else len(files_info)
-        for offset, idx in enumerate(range(idx0+1, next_idx), 1):
-            date_map[idx] = date0 + timedelta(days=offset)
-        if i == 0:
-            for offset, idx in enumerate(range(idx0-1, -1, -1), 1):
-                date_map[idx] = date0 - timedelta(days=offset)
-        else:
-            prev_idx = ref_dates_idx[i-1]["idx"]
-            prev_date = datetime.strptime(ref_dates_idx[i-1]["date"], "%Y-%m-%d")
-            span = idx0 - prev_idx
-            if span > 1:
-                for j, idx in enumerate(range(prev_idx+1, idx0), 1):
-                    date_map[idx] = prev_date + timedelta(days=j)
-    output = []
-    for i, f in enumerate(files_info):
-        date = f.get("date")
-        if not date:
-            date = date_map.get(i)
-            if isinstance(date, datetime):
-                date = date.strftime("%Y-%m-%d")
-        f2 = f.copy()
-        f2["date"] = date
-        output.append(f2)
-    return output
+def discover_all_records(raw_root):
+    """
+    Collect ALL records from ALL pedometer_day_summary folders across ALL exports.
+    Ordering: primarily by extracted raw_date (if valid & not 1970), otherwise by mtime, then by path.
+    """
+    pedo_dirs = find_all_pedometer_dirs(raw_root)
+    print(f"[INFO] pedometer dirs found: {len(pedo_dirs)}")
 
-def fix_bad_dates_in_csv(input_csv, output_csv, bad_date=BAD_DATE):
+    files = []
+    for d in pedo_dirs:
+        fset = find_all_binning_files_in_dir(d)
+        files.extend(fset)
+    print(f"[INFO] binning files found: {len(files)}")
+
+    # Parse all files
+    records = []
+    for fp in files:
+        rec = process_binning_json(fp)
+        if rec:
+            records.append(rec)
+
+    # ---- FIX: make the sort key always NAIVE (no tz) to avoid naive/aware comparisons
+    def rec_sort_key(r):
+        rd = r.get("raw_date")
+        dt = None
+        if rd and rd != BAD_DATE:
+            try:
+                dt = datetime.strptime(rd, "%Y-%m-%d")  # naive
+            except Exception:
+                dt = None
+        # fallback: use UTC epoch as a NAIVE datetime
+        if dt is None:
+            dt = datetime.utcfromtimestamp(r["mtime"])  # naive
+        return (dt, r["file"])
+
+    records.sort(key=rec_sort_key)
+    return records
+
+# -------------------- CLUSTER → DATE MAPPING --------------------
+
+def find_sequence_index_after(records, steps_seq, start_at):
+    """Sliding-window match for steps sequence after start_at (inclusive)."""
+    L = len(steps_seq)
+    n = len(records)
+    for i in range(start_at, n - L + 1):
+        ok = True
+        for j in range(L):
+            if records[i + j]["steps"] != steps_seq[j]:
+                ok = False
+                break
+        if ok:
+            return i
+    return None
+
+def create_blank_timeline(cal_start=CAL_START, cal_end=CAL_END):
+    """Full blank, leap-safe timeline from cal_start..cal_end (inclusive)."""
+    days = (cal_end - cal_start).days + 1
     rows = []
-    with open(input_csv, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
+    for k in range(days):
+        d = cal_start + timedelta(days=k)
+        rows.append({"date": d.strftime("%Y-%m-%d"), "steps": 0, "distance_km": 0.0})
+    return rows
 
-    idx = len(rows) - 1
-    while idx >= 0 and rows[idx]['date'] == bad_date:
-        idx -= 1
-    if idx < 0:
-        print(f"No good dates found in {input_csv}, nothing to fix.")
-        # still write header + rows as-is
-        with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=["date", "steps", "distance_km"])
-            writer.writeheader()
-            for row in rows: writer.writerow(row)
-        return
+def assign_dates_map(records):
+    """
+    Anchor clusters and map each record index -> date, then return a
+    dict[date_str] = (steps, distance_km) using 'keep max steps per date'.
+    """
+    if not records:
+        return {}
 
-    last_good_date = datetime.strptime(rows[idx]['date'], "%Y-%m-%d")
-    for i in range(idx-1, -1, -1):
-        if rows[i]['date'] == bad_date:
-            last_good_date -= timedelta(days=1)
-            rows[i]['date'] = last_good_date.strftime("%Y-%m-%d")
+    # locate clusters sequentially
+    anchors = {}
+    search_from = 0
+    for c in CLUSTERS:
+        start_dt = datetime.strptime(c["start_date"], "%Y-%m-%d")
+        idx0 = find_sequence_index_after(records, c["steps_seq"], search_from)
+        if idx0 is None:
+            continue
+        for off in range(len(c["steps_seq"])):
+            anchors[idx0 + off] = start_dt + timedelta(days=off)
+        search_from = idx0 + len(c["steps_seq"])
+
+    if not anchors:
+        return {}
+
+    # index->date across whole records list
+    idx_to_date = dict(anchors)
+    known = sorted(idx_to_date.items(), key=lambda kv: kv[0])
+
+    # backward
+    first_idx, first_dt = known[0]
+    for i in range(first_idx - 1, -1, -1):
+        idx_to_date[i] = first_dt - timedelta(days=(first_idx - i))
+
+    # between
+    for a in range(len(known) - 1):
+        ia, da = known[a]
+        ib, db = known[a + 1]
+        for i in range(ia + 1, ib):
+            idx_to_date[i] = da + timedelta(days=(i - ia))
+
+    # forward
+    last_idx, last_dt = known[-1]
+    for i in range(last_idx + 1, len(records)):
+        idx_to_date[i] = last_dt + timedelta(days=(i - last_idx))
+
+    # date -> best record (max steps, tie: max distance)
+    by_date = {}
+    for i, rec in enumerate(records):
+        dt = idx_to_date.get(i)
+        if not isinstance(dt, datetime):
+            continue
+        ds = dt.strftime("%Y-%m-%d")
+        cur = by_date.get(ds)
+        if (cur is None) or (rec["steps"] > cur["steps"]) or (
+            rec["steps"] == cur["steps"] and rec["distance_km"] > cur["distance_km"]
+        ):
+            by_date[ds] = {"steps": rec["steps"], "distance_km": rec["distance_km"]}
+    return by_date
+
+def insert_data_after_timeline(timeline_rows, date_map):
+    """
+    Overlay genuine data into the pre-built timeline.
+    For each date, set to the max(steps) w.r.t. what's already there (zeros).
+    """
+    if not date_map:
+        return timeline_rows
+    idx = {r["date"]: i for i, r in enumerate(timeline_rows)}
+    for ds, rec in date_map.items():
+        if ds in idx:
+            i = idx[ds]
+            cur = timeline_rows[i]
+            if (rec["steps"] > cur["steps"]) or (
+                rec["steps"] == cur["steps"] and rec["distance_km"] > cur["distance_km"]
+            ):
+                timeline_rows[i] = {"date": ds, "steps": int(rec["steps"]), "distance_km": float(rec["distance_km"])}
+    return timeline_rows
+
+def dedupe_across_dates_preserve_timeline(timeline_rows):
+    """
+    Same-steps across different dates: keep the first, set later duplicates to zero.
+    (Zeros are never deduped.)
+    """
+    seen = set()
+    out = []
+    for r in sorted(timeline_rows, key=lambda x: x["date"]):
+        s = int(r["steps"])
+        if s == 0:
+            out.append(r)
+            continue
+        if s in seen:
+            out.append({"date": r["date"], "steps": 0, "distance_km": 0.0})
         else:
-            last_good_date = datetime.strptime(rows[i]['date'], "%Y-%m-%d")
-    rows.sort(key=lambda x: x["date"])
+            seen.add(s)
+            out.append(r)
+    return out
 
-    with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "steps", "distance_km"])
-        writer.writeheader()
-        for row in rows: writer.writerow(row)
-    print(f"Fixed CSV written to: {output_csv}")
+# -------------------- MAIN --------------------
 
 def main():
-    files = get_all_binning_files(BASE_DIR)
-    shealth_info, pedometer_info = [], []
-    for f in files:
-        key_style, file_info, _ = process_file(f)
-        if not key_style or not file_info: continue
-        (pedometer_info if key_style == "pedometer" else shealth_info).append(file_info)
+    # 1) Build the timeline FIRST (so it never gets wiped)
+    timeline = create_blank_timeline(CAL_START, CAL_END)
 
-    shealth_with_dates   = assign_dates(shealth_info,   REFERENCE_STEPS)
-    pedometer_with_dates = assign_dates(pedometer_info, REFERENCE_STEPS)
+    # 2) Discover & parse ALL records across ALL exports / pedometer folders
+    records = discover_all_records(RAW_DATA_ROOT)
+    print(f"[INFO] candidate records parsed: {len(records)}")
+    nonzero = sum(1 for r in records if r and (r["steps"] > 0 or r["distance_km"] > 0))
+    print(f"[INFO] non-zero records: {nonzero}")
 
-    # temp paths (will be deleted)
-    tmp_shealth_csv   = os.path.join(BASE_DIR, "_tmp_steps_summary_shealth.csv")
-    tmp_pedometer_csv = os.path.join(BASE_DIR, "_tmp_steps_summary_pedometer.csv")
-    final_csv         = os.path.join(BASE_DIR, "steps_summary_pedometer_fixed.csv")
+    # 3) Anchor clusters and compute a date->record map (may be empty)
+    date_map = assign_dates_map(records)
+    print(f"[INFO] mapped dates from records: {len(date_map)}")
 
-    # write temps
-    with open(tmp_shealth_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "steps", "distance_km"])
+    # 4) INSERT genuine data AFTER the timeline is built
+    timeline = insert_data_after_timeline(timeline, date_map)
+
+    # 5) Dedupe same steps across dates BUT preserve the timeline (later duplicates -> zeros)
+    timeline = dedupe_across_dates_preserve_timeline(timeline)
+
+    # 6) Write CSV
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    pedometer_csv = os.path.join(OUTPUT_DIR, "steps_summary_pedometer.csv")
+    with open(pedometer_csv, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=["date", "steps", "distance_km"])
         writer.writeheader()
-        for r in shealth_with_dates:
+        for r in sorted(timeline, key=lambda x: x["date"]):
             writer.writerow({"date": r["date"], "steps": r["steps"], "distance_km": r["distance_km"]})
-    with open(tmp_pedometer_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["date", "steps", "distance_km"])
-        writer.writeheader()
-        for r in pedometer_with_dates:
-            writer.writerow({"date": r["date"], "steps": r["steps"], "distance_km": r["distance_km"]})
-
-    # fix + write final (only pedometer is kept)
-    fix_bad_dates_in_csv(tmp_pedometer_csv, final_csv)
-
-    # delete temps + obsolete files
-    for p in [tmp_shealth_csv, tmp_pedometer_csv,
-              os.path.join(BASE_DIR, "steps_summary_shealth_fixed.csv"),
-              os.path.join(BASE_DIR, "steps_summary_shealth.csv"),
-              os.path.join(BASE_DIR, "steps_summary_pedometer.csv")]:
-        try:
-            if os.path.exists(p): os.remove(p)
-        except Exception as e:
-            print(f"Could not delete {p}: {e}")
-
-    print(f"FINAL: {final_csv}")
+    print(f"[OK] Wrote: {pedometer_csv}")
 
 if __name__ == "__main__":
     main()
