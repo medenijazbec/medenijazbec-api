@@ -489,17 +489,6 @@ select * from fitnessdaily;
 select * from aspnetusers;
 
 
-/* ─────────────────────────────────────────────────────────────────────────────
-   FitnessDaily triggers: boost low steps and keep DistanceKm in sync
-   Rule: if Steps < 3000 (or NULL), add 6000 + random(1000..2000)
-         DistanceKm := ROUND(Steps * 0.0007495, 2)
-   ───────────────────────────────────────────────────────────────────────────── */
-
--- Clean up any older trigger names you may have used previously
-DROP TRIGGER IF EXISTS fitnessdaily_after_insert_boost;
-DROP TRIGGER IF EXISTS tr_fitnessdaily_boost_steps_bi;
-DROP TRIGGER IF EXISTS tr_fitnessdaily_boost_steps_bu;
-
 DELIMITER $$
 
 -- BEFORE INSERT: boost low steps and compute DistanceKm via polynomial
@@ -558,7 +547,51 @@ BEGIN
   END IF;
 END$$
 
+
+
+-- NEW: compute CaloriesOut from Steps (runs after your step-boost trigger)
+DROP TRIGGER IF EXISTS tr_fitnessdaily_calories_bi $$
+CREATE TRIGGER tr_fitnessdaily_calories_bi
+BEFORE INSERT ON FitnessDaily
+FOR EACH ROW
+FOLLOWS tr_fitnessdaily_boost_steps_bi
+BEGIN
+  -- Simple, robust per-step model from your samples:
+  -- calories ≈ 0.04 × steps  (≈ 4 kcal per 100 steps)
+  -- Clamp to 0 and round to nearest integer.
+  IF NEW.Steps IS NULL OR NEW.Steps <= 0 THEN
+    SET NEW.CaloriesOut = NULL;
+  ELSE
+    SET NEW.CaloriesOut = CAST(ROUND(GREATEST(0, 0.04 * NEW.Steps)) AS SIGNED);
+  END IF;
+END$$
+
+-- Keep CaloriesOut in sync on updates as well (runs after your boost-on-update trigger)
+DROP TRIGGER IF EXISTS tr_fitnessdaily_calories_bu $$
+CREATE TRIGGER tr_fitnessdaily_calories_bu
+BEFORE UPDATE ON FitnessDaily
+FOR EACH ROW
+FOLLOWS tr_fitnessdaily_boost_steps_bu
+BEGIN
+  IF NEW.Steps IS NULL OR NEW.Steps <= 0 THEN
+    SET NEW.CaloriesOut = NULL;
+  ELSE
+    SET NEW.CaloriesOut = CAST(ROUND(GREATEST(0, 0.04 * NEW.Steps)) AS SIGNED);
+  END IF;
+END$$
+
+
 DELIMITER ;
+/* ─────────────────────────────────────────────────────────────────────────────
+   FitnessDaily triggers: boost low steps and keep DistanceKm in sync
+   Rule: if Steps < 3000 (or NULL), add 6000 + random(1000..2000)
+         DistanceKm := ROUND(Steps * 0.0007495, 2)
+   ───────────────────────────────────────────────────────────────────────────── */
+
+-- Clean up any older trigger names you may have used previously
+DROP TRIGGER IF EXISTS fitnessdaily_after_insert_boost;
+DROP TRIGGER IF EXISTS tr_fitnessdaily_boost_steps_bi;
+DROP TRIGGER IF EXISTS tr_fitnessdaily_boost_steps_bu;
 
 -- Optional quick checks:
 -- SHOW TRIGGERS LIKE 'FitnessDaily';

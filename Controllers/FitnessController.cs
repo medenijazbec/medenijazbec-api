@@ -6,6 +6,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using System.ComponentModel.DataAnnotations;
 using System.Globalization;
+using System.Linq;
 
 namespace honey_badger_api.Controllers
 {
@@ -199,5 +200,169 @@ namespace honey_badger_api.Controllers
                 to = to.Value.ToString("yyyy-MM-dd")
             });
         }
+
+        [HttpGet("fun-facts")]
+      
+        public async Task<ActionResult<FunFactsResponse>> GetFunFacts(
+        [FromQuery] string userId,
+        [FromQuery] DateOnly? from,
+        [FromQuery] DateOnly? to,
+        [FromQuery] bool includeSynthetic = false,
+        [FromQuery] int streakThreshold1 = 8000,
+        [FromQuery] int streakThreshold2 = 10000)
+        {
+            if (string.IsNullOrWhiteSpace(userId))
+                return BadRequest("userId is required.");
+
+            // default range: last 365 days (inclusive)
+            var today = DateOnly.FromDateTime(DateTime.UtcNow.Date);
+            var defaultFrom = today.AddDays(-365);
+            var f = from ?? defaultFrom;
+            var t = to ?? today;
+
+            var q = _db.FitnessDaily.AsNoTracking()
+                .Where(x => x.UserId == userId && x.Day >= f && x.Day <= t);
+
+            if (!includeSynthetic)
+                q = q.Where(x => (bool)!x.IsSynthetic);
+
+            var rows = await q
+                .Select(x => new {
+                    x.Day,
+                    Steps = x.Steps ?? 0,
+                    Km = x.DistanceKm,
+                    CaloriesOut = x.CaloriesOut,
+                    x.IsSynthetic
+                })
+                .OrderBy(x => x.Day)
+                .ToListAsync();
+
+            var totalDays = (t.ToDateTime(TimeOnly.MinValue) - f.ToDateTime(TimeOnly.MinValue)).Days + 1;
+            var withData = rows.Count;
+
+            long totalSteps = rows.Sum(r => (long)r.Steps);
+            decimal totalKm = rows.Sum(r => r.Km ?? 0m);
+            long? totalCalOut = rows.Any(r => r.CaloriesOut.HasValue)
+                ? rows.Sum(r => (long)(r.CaloriesOut ?? 0))
+                : null;
+
+            int avgSteps = withData > 0 ? (int)Math.Round(totalSteps / (double)withData) : 0;
+            decimal avgKm = withData > 0 ? Math.Round(totalKm / withData, 2) : 0m;
+
+            int daysGte10k = rows.Count(r => r.Steps >= 10000);
+            int daysGte15k = rows.Count(r => r.Steps >= 15000);
+            int daysKmGte5 = rows.Count(r => (r.Km ?? 0m) >= 5m);
+            int daysKmGte10 = rows.Count(r => (r.Km ?? 0m) >= 10m);
+
+            // Top lists
+            var topSteps = rows.OrderByDescending(r => r.Steps).ThenBy(r => r.Day).Take(10)
+                .Select(r => new TopDayDto(r.Day, r.Steps, r.Km, r.CaloriesOut, r.IsSynthetic)).ToArray();
+
+            var topKm = rows.OrderByDescending(r => r.Km ?? 0m).ThenBy(r => r.Day).Take(10)
+                .Select(r => new TopDayDto(r.Day, r.Steps, r.Km, r.CaloriesOut, r.IsSynthetic)).ToArray();
+
+            var topCal = rows.OrderByDescending(r => r.CaloriesOut ?? 0).ThenBy(r => r.Day).Take(10)
+                .Select(r => new TopDayDto(r.Day, r.Steps, r.Km, r.CaloriesOut, r.IsSynthetic)).ToArray();
+
+            // Weekday averages (1=Mon..7=Sun)
+            var weekdayAvgs = rows
+                .GroupBy(r => ((int)r.Day.ToDateTime(TimeOnly.MinValue).DayOfWeek + 6) % 7 + 1)
+                .Select(g => new WeekdayAvgDto(
+                    Weekday: g.Key,
+                    AvgSteps: (int)Math.Round(g.Average(x => (double)x.Steps)),
+                    AvgKm: (decimal)Math.Round(g.Average(x => (double)(x.Km ?? 0m)), 2)
+                ))
+                .OrderBy(w => w.Weekday)
+                .ToArray();
+
+            // Best month (by steps / by km)
+            var monthGroups = rows
+                .GroupBy(r => new { r.Day.Year, r.Day.Month })
+                .Select(g => new MonthSumDto(
+                    Year: g.Key.Year,
+                    Month: g.Key.Month,
+                    StepsSum: g.Sum(x => (long)x.Steps),
+                    KmSum: g.Sum(x => x.Km ?? 0m),
+                    Days: g.Count()
+                ))
+                .ToList();
+
+            var bestMonthSteps = monthGroups
+                .OrderByDescending(m => m.StepsSum)
+                .ThenBy(m => m.Year).ThenBy(m => m.Month)
+                .FirstOrDefault() ?? new MonthSumDto(0, 0, 0, 0m, 0);
+
+            var bestMonthKm = monthGroups
+                .OrderByDescending(m => m.KmSum)
+                .ThenBy(m => m.Year).ThenBy(m => m.Month)
+                .FirstOrDefault() ?? new MonthSumDto(0, 0, 0, 0m, 0);
+
+            // Longest streaks (>= threshold)
+            static StreakDto LongestStreak(List<dynamic> src, int threshold)
+            {
+                int best = 0, cur = 0;
+                DateOnly? bestStart = null, bestEnd = null, curStart = null;
+
+                foreach (var r in src)
+                {
+                    if (r.Steps >= threshold)
+                    {
+                        if (cur == 0) curStart = r.Day;
+                        cur++;
+                        if (cur > best)
+                        {
+                            best = cur;
+                            bestStart = curStart;
+                            bestEnd = r.Day;
+                        }
+                    }
+                    else
+                    {
+                        cur = 0; curStart = null;
+                    }
+                }
+                return new StreakDto(threshold, best, bestStart, bestEnd);
+            }
+
+            var bestStreak8k = LongestStreak(rows.Cast<dynamic>().ToList(), streakThreshold1);
+            var bestStreak10k = LongestStreak(rows.Cast<dynamic>().ToList(), streakThreshold2);
+
+            // 7-day rolling PR (by steps) – optional but fun
+            // (Not returned as separate field to keep payload compact; you can add if you want.)
+
+            var resp = new FunFactsResponse(
+                TotalDays: totalDays,
+                DaysWithData: withData,
+                TotalSteps: totalSteps,
+                TotalKm: Math.Round(totalKm, 2),
+                TotalCaloriesOut: totalCalOut,
+                AvgSteps: avgSteps,
+                AvgKm: avgKm,
+                DaysStepsGte10k: daysGte10k,
+                DaysStepsGte15k: daysGte15k,
+                DaysKmGte5: daysKmGte5,
+                DaysKmGte10: daysKmGte10,
+                BestStreakGte8k: bestStreak8k,
+                BestStreakGte10k: bestStreak10k,
+                WeekdayAverages: weekdayAvgs,
+                BestMonthBySteps: bestMonthSteps,
+                BestMonthByKm: bestMonthKm,
+                Top10BySteps: topSteps,
+                Top10ByKm: topKm,
+                Top10ByCaloriesOut: topCal
+            );
+
+            return Ok(resp);
+        }
+        [Authorize(Roles = "Admin")]
+        [HttpDelete("daily/all")]
+        public async Task<IActionResult> DeleteAllDaily()
+        {
+            // If you prefer to reset identity/autoincrement too, you can TRUNCATE instead
+            // but TRUNCATE may require extra permissions depending on your DB.
+            var deleted = await _db.Database.ExecuteSqlRawAsync("DELETE FROM fitnessdaily;");
+            return Ok(new { deleted });
+        }
+
     }
 }
