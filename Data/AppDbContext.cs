@@ -106,8 +106,11 @@ namespace honey_badger_api.Data
                 .HasIndex(x => x.Status);
 
             // Anim Groups
-            b.Entity<AnimationGroup>()
-                .HasIndex(g => g.Slug).IsUnique();
+            b.Entity<AnimationGroup>().HasIndex(g => g.Slug).IsUnique();
+
+            b.Entity<AnimationGroup>().HasIndex(g => new { g.Category, g.Published });
+            b.Entity<AnimationGroup>().HasIndex(g => new { g.Category, g.IsDefaultForCategory });
+
 
             b.Entity<AnimationGroupItem>()
                 .HasOne(i => i.Group)
@@ -115,8 +118,8 @@ namespace honey_badger_api.Data
                 .HasForeignKey(i => i.GroupId)
                 .OnDelete(DeleteBehavior.Cascade);
 
-            b.Entity<AnimationGroupItem>()
-                .HasIndex(i => new { i.GroupId, i.SortOrder });
+            b.Entity<AnimationGroupItem>().HasIndex(i => new { i.GroupId, i.SortOrder });
+
         }
     }
 }

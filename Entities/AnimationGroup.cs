@@ -11,6 +11,11 @@ namespace honey_badger_api.Entities
         public string? TagsJson { get; set; }
         public bool Published { get; set; } = false;
 
+        //  categorization and default-per-category toggle
+        // examples: "page-load", "combat", "idle", "tricks"
+        public string Category { get; set; } = "misc";
+        public bool IsDefaultForCategory { get; set; } = false;
+
         public string? AuthorUserId { get; set; }
         public AppUser? AuthorUser { get; set; }
 

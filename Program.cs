@@ -4,13 +4,14 @@ using honey_badger_api.Abstractions;
 using honey_badger_api.Data;
 using honey_badger_api.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using System.Text;
-using Microsoft.AspNetCore.Http.Features;
+using System.Text.Json.Serialization;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 1) Load .env (first), then build configuration
@@ -209,7 +210,12 @@ builder.Services.Configure<FormOptions>(o =>
     o.ValueLengthLimit = int.MaxValue;
     o.MultipartHeadersLengthLimit = int.MaxValue;
 });
-
+builder.Services.AddControllers()
+    .AddJsonOptions(o =>
+    {
+        // If any other entity has a cycle, ignore it instead of throwing.
+        o.JsonSerializerOptions.ReferenceHandler = ReferenceHandler.IgnoreCycles;
+    });
 // Also bump Kestrel body size (only matters if not behind IIS)
 builder.WebHost.ConfigureKestrel(o =>
 {
