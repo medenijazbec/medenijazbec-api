@@ -475,6 +475,18 @@ CREATE TABLE IF NOT EXISTS `MetricSnapshots` (
   KEY `IX_MetricSnapshots_WindowStartUtc` (`WindowStartUtc`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+
+ALTER TABLE `AnimationGroups`
+  ADD COLUMN `Category` VARCHAR(64) NOT NULL DEFAULT 'misc' AFTER `Published`,
+  ADD COLUMN `IsDefaultForCategory` TINYINT(1) NOT NULL DEFAULT 0 AFTER `Category`;
+
+CREATE INDEX `IX_AnimationGroups_Category_Published`
+  ON `AnimationGroups` (`Category`, `Published`);
+
+CREATE INDEX `IX_AnimationGroups_Category_IsDefaultForCategory`
+  ON `AnimationGroups` (`Category`, `IsDefaultForCategory`);
+
+
 SELECT COUNT(*) FROM FitnessDaily WHERE UserId = ':uid';
 
 delete from fitnessdaily;
@@ -488,6 +500,10 @@ select * from fitnessdaily where steps < 1000;
 select * from fitnessdaily;
 select * from aspnetusers;
 
+select *  from animationgroups;
+delete from animationgroups where id =9;
+delete from animationgroups;
+delete from animationgroupitems;
 
 DELIMITER $$
 
@@ -587,6 +603,94 @@ DELIMITER ;
    Rule: if Steps < 3000 (or NULL), add 6000 + random(1000..2000)
          DistanceKm := ROUND(Steps * 0.0007495, 2)
    ───────────────────────────────────────────────────────────────────────────── */
+
+-- ─────────────────────────────────────────────────────────────────────────────
+-- Badger / Stage Settings (single-row live config + optional extra profiles)
+-- ─────────────────────────────────────────────────────────────────────────────
+CREATE TABLE IF NOT EXISTS `BadgerSettings` (
+  `Id`             INT         NOT NULL,         -- 1 = current/live settings; other Ids may be saved profiles
+  -- Positions
+  `OffsetY`        INT         NOT NULL DEFAULT 0,
+  `SaucerOffsetY`  INT         NOT NULL DEFAULT 0,
+  -- Lighting
+  `LightYaw`       INT         NOT NULL DEFAULT 0,
+  `LightHeight`    INT         NOT NULL DEFAULT 120,
+  `LightDist`      INT         NOT NULL DEFAULT 200,
+  -- Admin-chosen zooms (saved manually)
+  `ModelZoom`      DOUBLE      NOT NULL DEFAULT 1.0,
+  `SaucerZoom`     DOUBLE      NOT NULL DEFAULT 1.0,
+  `CameraZoom`     DOUBLE      NOT NULL DEFAULT 1.0,
+  -- Timestamps
+  `UpdatedUtc`     DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6) ON UPDATE CURRENT_TIMESTAMP(6),
+  PRIMARY KEY (`Id`)
+) ENGINE=InnoDB
+  DEFAULT CHARSET=utf8mb4
+  COLLATE=utf8mb4_unicode_ci;
+
+-- Seed the live row (Id=1) if it doesn't exist yet
+INSERT INTO `BadgerSettings` (`Id`, `OffsetY`, `SaucerOffsetY`, `LightYaw`, `LightHeight`, `LightDist`,
+                              `ModelZoom`, `SaucerZoom`, `CameraZoom`)
+SELECT 1, 0, 0, 0, 120, 200, 1.0, 1.0, 1.0
+WHERE NOT EXISTS (SELECT 1 FROM `BadgerSettings` WHERE `Id` = 1);
+
+-- Optional: history/audit of changes to settings (no app changes needed)
+CREATE TABLE IF NOT EXISTS `BadgerSettingsHistory` (
+  `Id`             BIGINT      NOT NULL AUTO_INCREMENT,
+  `SettingsId`     INT         NOT NULL,         -- matches BadgerSettings.Id (usually 1)
+  `ChangedUtc`     DATETIME(6) NOT NULL,
+  `ChangedBy`      VARCHAR(255) NULL,            -- DB user or app-level user if you wire it in later
+  `OffsetY`        INT         NOT NULL,
+  `SaucerOffsetY`  INT         NOT NULL,
+  `LightYaw`       INT         NOT NULL,
+  `LightHeight`    INT         NOT NULL,
+  `LightDist`      INT         NOT NULL,
+  `ModelZoom`      DOUBLE      NOT NULL,
+  `SaucerZoom`     DOUBLE      NOT NULL,
+  `CameraZoom`     DOUBLE      NOT NULL,
+  PRIMARY KEY (`Id`),
+  KEY `IX_BadgerSettingsHistory_Settings_Changed` (`SettingsId`, `ChangedUtc`),
+  CONSTRAINT `FK_BadgerSettingsHistory_Settings`
+    FOREIGN KEY (`SettingsId`) REFERENCES `BadgerSettings`(`Id`) ON DELETE CASCADE
+) ENGINE=InnoDB
+  DEFAULT CHARSET=utf8mb4
+  COLLATE=utf8mb4_unicode_ci;
+
+DELIMITER $$
+
+-- Audit on INSERT (initial creation or when you add more profiles)
+DROP TRIGGER IF EXISTS `tr_badger_settings_ai` $$
+CREATE TRIGGER `tr_badger_settings_ai`
+AFTER INSERT ON `BadgerSettings`
+FOR EACH ROW
+BEGIN
+  INSERT INTO `BadgerSettingsHistory`
+  (`SettingsId`, `ChangedUtc`, `ChangedBy`,
+   `OffsetY`, `SaucerOffsetY`, `LightYaw`, `LightHeight`, `LightDist`,
+   `ModelZoom`, `SaucerZoom`, `CameraZoom`)
+  VALUES
+  (NEW.`Id`, NOW(6), CURRENT_USER(),
+   NEW.`OffsetY`, NEW.`SaucerOffsetY`, NEW.`LightYaw`, NEW.`LightHeight`, NEW.`LightDist`,
+   NEW.`ModelZoom`, NEW.`SaucerZoom`, NEW.`CameraZoom`);
+END$$
+
+-- Audit on UPDATE (every save from the admin UI/controller)
+DROP TRIGGER IF EXISTS `tr_badger_settings_au` $$
+CREATE TRIGGER `tr_badger_settings_au`
+AFTER UPDATE ON `BadgerSettings`
+FOR EACH ROW
+BEGIN
+  INSERT INTO `BadgerSettingsHistory`
+  (`SettingsId`, `ChangedUtc`, `ChangedBy`,
+   `OffsetY`, `SaucerOffsetY`, `LightYaw`, `LightHeight`, `LightDist`,
+   `ModelZoom`, `SaucerZoom`, `CameraZoom`)
+  VALUES
+  (NEW.`Id`, NOW(6), CURRENT_USER(),
+   NEW.`OffsetY`, NEW.`SaucerOffsetY`, NEW.`LightYaw`, NEW.`LightHeight`, NEW.`LightDist`,
+   NEW.`ModelZoom`, NEW.`SaucerZoom`, NEW.`CameraZoom`);
+END$$
+DELIMITER ;
+
+
 
 -- Clean up any older trigger names you may have used previously
 DROP TRIGGER IF EXISTS fitnessdaily_after_insert_boost;

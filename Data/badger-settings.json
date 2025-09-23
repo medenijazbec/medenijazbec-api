@@ -1,6 +1,7 @@
 {
-  "OffsetY": 0,
-  "LightYaw": 329,
+  "OffsetY": 87,
+  "SaucerOffsetY": 69,
+  "LightYaw": 0,
   "LightHeight": 120,
   "LightDist": 200
 }

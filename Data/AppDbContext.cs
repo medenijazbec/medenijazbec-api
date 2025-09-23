@@ -30,7 +30,7 @@ namespace honey_badger_api.Data
         public DbSet<LoginSession> LoginSessions => Set<LoginSession>();
         public DbSet<IpBan> IpBans => Set<IpBan>();
         public DbSet<MetricSnapshot> MetricSnapshots => Set<MetricSnapshot>();
-
+        public DbSet<BadgerSettings> BadgerSettings => Set<BadgerSettings>();
         protected override void OnModelCreating(ModelBuilder b)
         {
             base.OnModelCreating(b);
