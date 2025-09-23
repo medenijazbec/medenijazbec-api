@@ -2,8 +2,10 @@
 using DotNetEnv;
 using honey_badger_api.Abstractions;
 using honey_badger_api.Data;
+using honey_badger_api.Entities;
 using honey_badger_api.Services;
 using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Identity;
 using Microsoft.EntityFrameworkCore;
@@ -11,6 +13,7 @@ using Microsoft.Extensions.FileProviders;
 using Microsoft.IdentityModel.Tokens;
 using Microsoft.OpenApi.Models;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -268,5 +271,62 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapControllers();
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Badger settings (shared UI state) — Everyone can GET; only Admin can POST
+// ─────────────────────────────────────────────────────────────────────────────
+var dataDir = Path.Combine(app.Environment.ContentRootPath, "data");
+var settingsFile = Path.Combine(dataDir, "badger-settings.json");
+var defaults = new BadgerSettings(); // OffsetY=0, LightYaw=0, LightHeight=120, LightDist=200
+
+app.MapGet("/api/badger-settings", async () =>
+{
+    var s = await ReadBadgerSettings(settingsFile, defaults);
+    return Results.Ok(s);
+});
+
+app.MapPost("/api/badger-settings", async (BadgerSettings incoming) =>
+{
+    var next = defaults with
+    {
+        OffsetY = incoming.OffsetY,
+        LightYaw = incoming.LightYaw,
+        LightHeight = incoming.LightHeight,
+        LightDist = incoming.LightDist
+    };
+    Directory.CreateDirectory(dataDir);
+    var json = JsonSerializer.Serialize(next, new JsonSerializerOptions { WriteIndented = true });
+    await File.WriteAllTextAsync(settingsFile, json);
+    return Results.Ok(new { ok = true, settings = next });
+})
+.RequireAuthorization(new AuthorizeAttribute { Roles = "Admin" }); // JWT role gate
+static async Task<BadgerSettings> ReadBadgerSettings(string path, BadgerSettings defaults)
+{
+try
+{
+var json = await File.ReadAllTextAsync(path);
+var s = JsonSerializer.Deserialize<BadgerSettings>(json, new JsonSerializerOptions
+{
+PropertyNameCaseInsensitive = true
+});
+return s is null ? defaults : defaults with
+{
+OffsetY = s.OffsetY,
+LightYaw = s.LightYaw,
+LightHeight = s.LightHeight,
+LightDist = s.LightDist
+};
+}
+catch
+{
+Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+var json = JsonSerializer.Serialize(defaults, new JsonSerializerOptions { WriteIndented = true });
+await File.WriteAllTextAsync(path, json);
+return defaults;
+}
+}
+
+
+
 
 app.Run();
