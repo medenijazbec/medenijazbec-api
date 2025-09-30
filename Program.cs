@@ -54,6 +54,35 @@ builder.Services.AddDbContext<AppDbContext>(opt =>
     opt.UseMySql(connectionString, ServerVersion.AutoDetect(connectionString));
 });
 
+
+// helper re-used for both connections
+static string BuildMySql(string host, string port, string user, string pw, string db)
+    => $"Server={host};Port={port};Database={db};User={user};Password={pw};Pooling=true;TreatTinyAsBoolean=false;SslMode=None;";
+
+// SECOND DB: NvdaAlpha (TrueNAS)
+string? nvdaConn =
+    Environment.GetEnvironmentVariable("ConnectionStrings__NvdaAlpha")
+    ?? Environment.GetEnvironmentVariable("NVDA_DB_CONNECTION")
+    ?? (
+        (Environment.GetEnvironmentVariable("NVDA_DB_HOST") is string h &&
+         Environment.GetEnvironmentVariable("NVDA_DB_PORT") is string p &&
+         Environment.GetEnvironmentVariable("NVDA_DB_USER") is string u &&
+         Environment.GetEnvironmentVariable("NVDA_DB_PASSWORD") is string pw &&
+         Environment.GetEnvironmentVariable("NVDA_DB_NAME") is string d)
+        ? BuildMySql(h, p, u, pw, d)
+        : null
+    );
+
+if (string.IsNullOrWhiteSpace(nvdaConn))
+{
+    throw new InvalidOperationException("NvdaAlpha connection missing: set NVDA_DB_* or ConnectionStrings__NvdaAlpha");
+}
+
+builder.Services.AddDbContext<NvdaAlphaDbContext>(opt =>
+    opt.UseMySql(nvdaConn, ServerVersion.AutoDetect(nvdaConn),
+        my => my.EnableRetryOnFailure()));
+
+
 builder.Services
     .AddIdentity<AppUser, IdentityRole>(opt =>
     {
@@ -223,6 +252,17 @@ builder.Services.AddControllers()
 builder.WebHost.ConfigureKestrel(o =>
 {
     o.Limits.MaxRequestBodySize = 1_500_000_000;
+});
+
+// NvdaAlpha (second DB)
+builder.Services.AddDbContext<NvdaAlphaDbContext>(opt =>
+{
+    opt.UseMySql(nvdaConn!, ServerVersion.AutoDetect(nvdaConn), my => my.EnableRetryOnFailure());
+    if (builder.Environment.IsDevelopment())
+    {
+        opt.EnableDetailedErrors();
+        opt.EnableSensitiveDataLogging();
+    }
 });
 
 builder.Services.AddHostedService<honey_badger_api.Services.TelemetryRollupService>();
