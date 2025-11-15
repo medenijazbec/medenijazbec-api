@@ -98,6 +98,35 @@ builder.Services
     .AddEntityFrameworkStores<AppDbContext>()
     .AddDefaultTokenProviders();
 
+// THIRD DB: NvdaTrading (candle-level trading_candles DB on TrueNAS)
+// Env precedence:
+//   1) ConnectionStrings__NvdaTrading
+//   2) NVDA_TRADING_DB_CONNECTION
+//   3) NVDA_TRADING_DB_HOST / PORT / USER / PASSWORD / NAME
+string? nvdaTradingConn =
+    Environment.GetEnvironmentVariable("ConnectionStrings__NvdaTrading")
+    ?? Environment.GetEnvironmentVariable("NVDA_TRADING_DB_CONNECTION")
+    ?? (
+        (Environment.GetEnvironmentVariable("NVDA_TRADING_DB_HOST") is string th &&
+         Environment.GetEnvironmentVariable("NVDA_TRADING_DB_PORT") is string tp &&
+         Environment.GetEnvironmentVariable("NVDA_TRADING_DB_USER") is string tu &&
+         Environment.GetEnvironmentVariable("NVDA_TRADING_DB_PASSWORD") is string tpw &&
+         Environment.GetEnvironmentVariable("NVDA_TRADING_DB_NAME") is string td)
+         ? BuildMySql(th, tp, tu, tpw, td)
+         : null
+    );
+
+if (string.IsNullOrWhiteSpace(nvdaTradingConn))
+{
+    throw new InvalidOperationException("NvdaTrading connection missing: set NVDA_TRADING_DB_* or ConnectionStrings__NvdaTrading");
+}
+
+builder.Services.AddDbContext<NvdaTradingDbContext>(opt =>
+    opt.UseMySql(nvdaTradingConn, ServerVersion.AutoDetect(nvdaTradingConn),
+        my => my.EnableRetryOnFailure()));
+
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 3) JWT Auth
 //    Reads from ENV first, then appsettings:
@@ -258,6 +287,17 @@ builder.WebHost.ConfigureKestrel(o =>
 builder.Services.AddDbContext<NvdaAlphaDbContext>(opt =>
 {
     opt.UseMySql(nvdaConn!, ServerVersion.AutoDetect(nvdaConn), my => my.EnableRetryOnFailure());
+    if (builder.Environment.IsDevelopment())
+    {
+        opt.EnableDetailedErrors();
+        opt.EnableSensitiveDataLogging();
+    }
+});
+// NvdaTrading (third DB)
+builder.Services.AddDbContext<NvdaTradingDbContext>(opt =>
+{
+    opt.UseMySql(nvdaTradingConn!, ServerVersion.AutoDetect(nvdaTradingConn),
+        my => my.EnableRetryOnFailure());
     if (builder.Environment.IsDevelopment())
     {
         opt.EnableDetailedErrors();
