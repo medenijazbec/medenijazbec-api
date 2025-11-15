@@ -25,19 +25,22 @@ public sealed class NvdaTradingController : ControllerBase
     // -----------------------------------------------------------------------
 
     public sealed record TradingSettingsDto(
-        string Symbol,
-        string TimeframeCode,
-        int TimeframeMinutes,
-        string DataProvider,
-        double InitialCapitalPerWorker,
-        int HistoricalCandles,
-        DateTime UpdatedUtc
+        string symbol,
+        string timeframeCode,
+        int timeframeMinutes,
+        string dataProvider,
+        double initialCapitalPerWorker,
+        int historicalCandles,
+        DateTime updatedUtc
     );
 
     private async Task<NvdaTradingSettings> EnsureSettingsRowAsync()
     {
         // Single global row (Id = 1)
-        var settings = await _tradingDb.TradingSettings.AsTracking().FirstOrDefaultAsync(s => s.Id == 1);
+        var settings = await _tradingDb.TradingSettings
+            .AsTracking()
+            .FirstOrDefaultAsync(s => s.Id == 1);
+
         if (settings != null) return settings;
 
         settings = new NvdaTradingSettings
@@ -73,12 +76,12 @@ public sealed class NvdaTradingController : ControllerBase
     }
 
     public sealed record UpdateTradingSettingsRequest(
-        string Symbol,
-        string TimeframeCode,
-        int TimeframeMinutes,
-        string DataProvider,
-        double InitialCapitalPerWorker,
-        int HistoricalCandles
+        string symbol,
+        string timeframeCode,
+        int timeframeMinutes,
+        string dataProvider,
+        double initialCapitalPerWorker,
+        int historicalCandles
     );
 
     /// <summary>
@@ -92,21 +95,25 @@ public sealed class NvdaTradingController : ControllerBase
         var s = await EnsureSettingsRowAsync();
 
         // basic validation
-        if (string.IsNullOrWhiteSpace(req.Symbol))
+        if (string.IsNullOrWhiteSpace(req.symbol))
             return BadRequest("Symbol is required.");
-        if (req.TimeframeMinutes <= 0)
-            return BadRequest("TimeframeMinutes must be > 0.");
-        if (req.InitialCapitalPerWorker <= 0)
-            return BadRequest("InitialCapitalPerWorker must be > 0.");
-        if (req.HistoricalCandles <= 0)
-            return BadRequest("HistoricalCandles must be > 0.");
+        if (req.timeframeMinutes <= 0)
+            return BadRequest("timeframeMinutes must be > 0.");
+        if (req.initialCapitalPerWorker <= 0)
+            return BadRequest("initialCapitalPerWorker must be > 0.");
+        if (req.historicalCandles <= 0)
+            return BadRequest("historicalCandles must be > 0.");
 
-        s.Symbol = req.Symbol.Trim().ToUpperInvariant();
-        s.TimeframeCode = req.TimeframeCode.Trim();
-        s.TimeframeMinutes = req.TimeframeMinutes;
-        s.DataProvider = req.DataProvider.Trim().ToLowerInvariant(); // "alpha" or "finnhub"
-        s.InitialCapitalPerWorker = req.InitialCapitalPerWorker;
-        s.HistoricalCandles = req.HistoricalCandles;
+        var provider = (req.dataProvider ?? string.Empty).Trim().ToLowerInvariant();
+        if (provider is not ("alpha" or "finnhub"))
+            return BadRequest("dataProvider must be 'alpha' or 'finnhub'.");
+
+        s.Symbol = req.symbol.Trim().ToUpperInvariant();
+        s.TimeframeCode = req.timeframeCode.Trim();
+        s.TimeframeMinutes = req.timeframeMinutes;
+        s.DataProvider = provider;
+        s.InitialCapitalPerWorker = req.initialCapitalPerWorker;
+        s.HistoricalCandles = req.historicalCandles;
         s.UpdatedUtc = DateTime.UtcNow;
 
         await _tradingDb.SaveChangesAsync();
@@ -127,17 +134,18 @@ public sealed class NvdaTradingController : ControllerBase
     // -----------------------------------------------------------------------
 
     public sealed record WorkerOverviewDto(
-        int Id,
-        string Name,
-        string StrategyName,
-        double InitialCapital,
-        double? Equity,
-        double? Cash,
-        double? RealizedPnl,
-        double? UnrealizedPnl,
-        int? OpenPositions,
-        int? TotalTrades,
-        DateTime? SnapshotUtc
+        int id,
+        string name,
+        string strategyName,
+        double initialCapital,
+        double? equity,
+        double? cash,
+        double? realizedPnl,
+        double? unrealizedPnl,
+        int? openPositions,
+        int? totalTrades,
+        DateTime? snapshotUtc,
+        string? ownerUserId
     );
 
     /// <summary>
@@ -149,34 +157,42 @@ public sealed class NvdaTradingController : ControllerBase
     {
         var workers = await _tradingDb.Workers.AsNoTracking().ToListAsync();
 
-        // Latest stat per worker (by SnapshotUtc)
-        var latestStats = await _tradingDb.WorkerStats.AsNoTracking()
-            .GroupBy(s => s.WorkerId)
-            .Select(g => g.OrderByDescending(x => x.SnapshotUtc).First())
+        // Fetch stats from DB, then group in memory to avoid EF Core GroupBy translation issues.
+        var stats = await _tradingDb.WorkerStats
+            .AsNoTracking()
+            .OrderBy(s => s.WorkerId)
+            .ThenByDescending(s => s.SnapshotUtc)
             .ToListAsync();
+
+        var latestByWorkerId = stats
+            .GroupBy(s => s.WorkerId)
+            .ToDictionary(
+                g => g.Key,
+                g => g.First()
+            );
 
         var joined =
             from w in workers
-            join s in latestStats on w.Id equals s.WorkerId into statsJoin
-            from s in statsJoin.DefaultIfEmpty()
+            let stat = latestByWorkerId.GetValueOrDefault(w.Id)
             select new WorkerOverviewDto(
                 w.Id,
                 w.Name,
                 w.StrategyName,
                 w.InitialCapital,
-                s?.Equity,
-                s?.Cash,
-                s?.RealizedPnl,
-                s?.UnrealizedPnl,
-                s?.OpenPositions,
-                s?.TotalTrades,
-                s?.SnapshotUtc
+                stat?.Equity,
+                stat?.Cash,
+                stat?.RealizedPnl,
+                stat?.UnrealizedPnl,
+                stat?.OpenPositions,
+                stat?.TotalTrades,
+                stat?.SnapshotUtc,
+                w.OwnerUserId
             );
 
         return Ok(joined.ToArray());
     }
 
-    public sealed record WorkerEquityPointDto(DateTime SnapshotUtc, double Equity);
+    public sealed record WorkerEquityPointDto(DateTime snapshotUtc, double equity);
 
     /// <summary>
     /// Simple equity time-series for a worker (for plotting worker's curve on frontend).
@@ -204,16 +220,16 @@ public sealed class NvdaTradingController : ControllerBase
     // -----------------------------------------------------------------------
 
     public sealed record MarketClockDto(
-        string Exchange,
-        bool IsOpenNow,
-        DateTime NowUtc,
-        DateTime NowLjubljana,
-        DateTime CurrentSessionOpenUtc,
-        DateTime CurrentSessionCloseUtc,
-        DateTime CurrentSessionOpenLjubljana,
-        DateTime CurrentSessionCloseLjubljana,
-        DateTime NextSessionOpenUtc,
-        DateTime NextSessionOpenLjubljana
+        string exchange,
+        bool isOpenNow,
+        DateTime nowUtc,
+        DateTime nowLjubljana,
+        DateTime currentSessionOpenUtc,
+        DateTime currentSessionCloseUtc,
+        DateTime currentSessionOpenLjubljana,
+        DateTime currentSessionCloseLjubljana,
+        DateTime nextSessionOpenUtc,
+        DateTime nextSessionOpenLjubljana
     );
 
     private static TimeZoneInfo TryGetTimeZone(params string[] ids)
@@ -252,9 +268,6 @@ public sealed class NvdaTradingController : ControllerBase
 
         var nowUtc = DateTime.UtcNow;
 
-        // Timezones:
-        //   - US/Eastern for NYSE/NASDAQ
-        //   - Europe/Ljubljana for your local time
         var tzEastern = TryGetTimeZone("America/New_York", "Eastern Standard Time");
         var tzLj = TryGetTimeZone("Europe/Ljubljana", "Central European Standard Time");
 
@@ -303,7 +316,6 @@ public sealed class NvdaTradingController : ControllerBase
         DateTime nextSessionOpenLocal;
         if (isWeekend)
         {
-            // Already computed above: sessionOpenLocal
             nextSessionOpenLocal = sessionOpenLocal;
         }
         else if (nowUtc < sessionOpenUtc)
@@ -331,18 +343,183 @@ public sealed class NvdaTradingController : ControllerBase
         var nextOpenLj = TimeZoneInfo.ConvertTimeFromUtc(nextSessionOpenUtc, tzLj);
 
         var dto = new MarketClockDto(
-            Exchange: exchange,
-            IsOpenNow: isOpenNow,
-            NowUtc: nowUtc,
-            NowLjubljana: nowLj,
-            CurrentSessionOpenUtc: sessionOpenUtc,
-            CurrentSessionCloseUtc: sessionCloseUtc,
-            CurrentSessionOpenLjubljana: currentOpenLj,
-            CurrentSessionCloseLjubljana: currentCloseLj,
-            NextSessionOpenUtc: nextSessionOpenUtc,
-            NextSessionOpenLjubljana: nextOpenLj
+            exchange,
+            isOpenNow,
+            nowUtc,
+            nowLj,
+            sessionOpenUtc,
+            sessionCloseUtc,
+            currentOpenLj,
+            currentCloseLj,
+            nextSessionOpenUtc,
+            nextOpenLj
         );
 
         return Ok(dto);
+    }
+
+    // -----------------------------------------------------------------------
+    // 4) CANDLES + FEATURES (for charts)
+    // -----------------------------------------------------------------------
+
+    public sealed record CandleWithFeaturesDto(
+        DateTime openTimeUtc,
+        double open,
+        double high,
+        double low,
+        double close,
+        double? volume,
+        double? range,
+        double? body,
+        double? upperWick,
+        double? lowerWick,
+        double? bodyRatio,
+        double? bodyPos,
+        double? pos20,
+        double? pos50,
+        bool bullish,
+        bool doji,
+        bool hammer,
+        bool shootingStar
+    );
+
+    /// <summary>
+    /// Recent candles (OHLCV) plus (optionally) a subset of features from `candle_features`
+    /// for the currently configured SYMBOL + TIMEFRAME.
+    /// Right now we just return basic OHLCV + a crude bullish flag.
+    /// </summary>
+    [HttpGet("candles")]
+    public async Task<ActionResult<CandleWithFeaturesDto[]>> GetRecentCandles(
+        [FromQuery] int limit = 200)
+    {
+        if (limit <= 0) limit = 200;
+        if (limit > 1000) limit = 1000;
+
+        var settings = await EnsureSettingsRowAsync();
+
+        var symbol = await _tradingDb.Symbols
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Symbol == settings.Symbol);
+
+        if (symbol == null)
+            return Ok(Array.Empty<CandleWithFeaturesDto>());
+
+        var timeframe = await _tradingDb.Timeframes
+            .AsNoTracking()
+            .FirstOrDefaultAsync(tf => tf.Code == settings.TimeframeCode);
+
+        if (timeframe == null)
+            return Ok(Array.Empty<CandleWithFeaturesDto>());
+
+        // Use the candle entity directly; no navs are configured here.
+        var rawCandles = await _tradingDb.Candles
+            .AsNoTracking()
+            .Where(c => c.SymbolId == symbol.Id && c.TimeframeId == timeframe.Id)
+            .OrderByDescending(c => c.OpenTime)
+            .Take(limit)
+            .ToListAsync();
+
+        rawCandles.Reverse(); // oldest -> newest
+
+        var dtos = rawCandles
+            .Select(c =>
+            {
+                bool bullish = c.Close >= c.Open;
+
+                return new CandleWithFeaturesDto(
+                    c.OpenTime,   // openTimeUtc in DTO
+                    c.Open,
+                    c.High,
+                    c.Low,
+                    c.Close,
+                    c.Volume,
+                    null, // range
+                    null, // body
+                    null, // upperWick
+                    null, // lowerWick
+                    null, // bodyRatio
+                    null, // bodyPos
+                    null, // pos20
+                    null, // pos50
+                    bullish,
+                    false,
+                    false,
+                    false
+                );
+            })
+            .ToArray();
+
+        return Ok(dtos);
+    }
+
+    // -----------------------------------------------------------------------
+    // 5) TRADES (recent fills / log)
+    // -----------------------------------------------------------------------
+
+    public sealed record TradeDto(
+        long id,
+        int workerId,
+        string workerName,
+        string symbol,
+        string timeframeCode,
+        DateTime tradeTimeUtc,
+        string side,
+        double quantity,
+        double price,
+        double? realizedPnl,
+        string? notes
+    );
+
+    /// <summary>
+    /// Recent trades, optionally filtered by worker.
+    /// Example:
+    ///   /api/nvda-trading/trades?limit=50
+    ///   /api/nvda-trading/trades?workerId=3&limit=20
+    /// </summary>
+    [HttpGet("trades")]
+    public async Task<ActionResult<TradeDto[]>> GetRecentTrades(
+        [FromQuery] int? workerId = null,
+        [FromQuery] int limit = 100)
+    {
+        if (limit <= 0) limit = 100;
+        if (limit > 500) limit = 500;
+
+        var baseQuery = _tradingDb.Trades
+            .AsNoTracking()
+            .AsQueryable();
+
+        if (workerId.HasValue)
+        {
+            baseQuery = baseQuery.Where(t => t.WorkerId == workerId.Value);
+        }
+
+        // Join via FKs to avoid any nav assumptions
+        var joined =
+            from t in baseQuery
+            join w in _tradingDb.Workers.AsNoTracking() on t.WorkerId equals w.Id
+            join s in _tradingDb.Symbols.AsNoTracking() on t.SymbolId equals s.Id
+            join tf in _tradingDb.Timeframes.AsNoTracking() on t.TimeframeId equals tf.Id into tfJoin
+            from tf in tfJoin.DefaultIfEmpty()
+            select new { t, w, s, tf };
+
+        var trades = await joined
+            .OrderByDescending(x => x.t.TradeTimeUtc)
+            .Take(limit)
+            .Select(x => new TradeDto(
+                x.t.Id,
+                x.t.WorkerId,
+                x.w.Name,
+                x.s.Symbol,
+                x.tf != null ? x.tf.Code : "",
+                x.t.TradeTimeUtc,
+                x.t.Side,
+                x.t.Quantity,
+                x.t.Price,
+                x.t.RealizedPnl,
+                x.t.Notes
+            ))
+            .ToListAsync();
+
+        return Ok(trades);
     }
 }

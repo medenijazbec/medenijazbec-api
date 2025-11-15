@@ -1,5 +1,4 @@
-﻿// path: honey_badger_api/Data/NvdaTradingDbContext.cs
-using Microsoft.EntityFrameworkCore;
+﻿using Microsoft.EntityFrameworkCore;
 using System;
 using System.ComponentModel.DataAnnotations;
 using System.ComponentModel.DataAnnotations.Schema;
@@ -53,11 +52,11 @@ public sealed class NvdaTradingDbContext : DbContext
             .HasIndex(x => x.CandleId)
             .IsUnique();
 
-        // Trades: filter by worker + time
+        // Trades: filter by worker + time  (matches ix_trades_worker_time on worker_id + trade_time)
         b.Entity<NvdaTradingTrade>()
-            .HasIndex(x => new { x.WorkerId, x.CreatedUtc });
+            .HasIndex(x => new { x.WorkerId, x.TradeTimeUtc });
 
-        // Worker stats: we often need latest snapshot per worker
+        // Worker stats: latest snapshot per worker (worker_id + timestamp)
         b.Entity<NvdaTradingWorkerStats>()
             .HasIndex(x => new { x.WorkerId, x.SnapshotUtc });
 
@@ -83,6 +82,8 @@ public sealed class NvdaTradingSymbol
     /// <summary>Exchange short code, e.g. "NASDAQ", "NYSE", "XNAS"</summary>
     [Column("exchange")] public string? Exchange { get; set; }
 
+    [Column("is_active")] public bool IsActive { get; set; }
+
     [Column("created_at")] public DateTime CreatedAt { get; set; }
 }
 
@@ -97,7 +98,7 @@ public sealed class NvdaTradingTimeframe
     /// <summary>Number of minutes for this timeframe (1, 5, 15, 60, ...)</summary>
     [Column("minutes")] public int Minutes { get; set; }
 
-    [Column("created_at")] public DateTime CreatedAt { get; set; }
+    // NOTE: DDL doesn't have created_at on timeframes, so no property here.
 }
 
 [Table("workers")]
@@ -122,6 +123,8 @@ public sealed class NvdaTradingWorker
     /// </summary>
     [Column("owner_user_id")] public string? OwnerUserId { get; set; }
 
+    [Column("is_active")] public bool IsActive { get; set; }
+
     [Column("created_at")] public DateTime CreatedAt { get; set; }
 }
 
@@ -136,11 +139,13 @@ public sealed class NvdaTradingCandle
     /// <summary>Candle open time (UTC, but stored as naive in MySQL)</summary>
     [Column("open_time")] public DateTime OpenTime { get; set; }
 
+    [Column("close_time")] public DateTime? CloseTime { get; set; }
+
     [Column("open")] public double Open { get; set; }
     [Column("high")] public double High { get; set; }
     [Column("low")] public double Low { get; set; }
     [Column("close")] public double Close { get; set; }
-    [Column("volume")] public double Volume { get; set; }
+    [Column("volume")] public double? Volume { get; set; }
 
     [Column("created_at")] public DateTime CreatedAt { get; set; }
 }
@@ -152,8 +157,8 @@ public sealed class NvdaTradingCandleFeatures
 
     [Column("candle_id")] public long CandleId { get; set; }
 
-    [Column("return_")] public double? Return { get; set; }
-    [Column("range_")] public double? Range { get; set; }
+    [Column("return")] public double? Return { get; set; }
+    [Column("range")] public double? Range { get; set; }
     [Column("body")] public double? Body { get; set; }
     [Column("upper_wick")] public double? UpperWick { get; set; }
     [Column("lower_wick")] public double? LowerWick { get; set; }
@@ -177,6 +182,8 @@ public sealed class NvdaTradingCandleFeatures
     [Column("sin_t")] public double? SinT { get; set; }
     [Column("cos_t")] public double? CosT { get; set; }
     [Column("timeframe_minutes")] public int? TimeframeMinutes { get; set; }
+
+    [Column("created_at")] public DateTime CreatedAt { get; set; }
 }
 
 [Table("trades")]
@@ -186,8 +193,8 @@ public sealed class NvdaTradingTrade
 
     [Column("worker_id")] public int WorkerId { get; set; }
     [Column("symbol_id")] public int SymbolId { get; set; }
-    [Column("timeframe_id")] public int TimeframeId { get; set; }
-    [Column("candle_id")] public long CandleId { get; set; }
+    [Column("timeframe_id")] public int? TimeframeId { get; set; }
+    [Column("candle_id")] public long? CandleId { get; set; }
 
     /// <summary>"BUY" / "SELL"</summary>
     [Column("side")] public string Side { get; set; } = "";
@@ -195,12 +202,15 @@ public sealed class NvdaTradingTrade
     [Column("quantity")] public double Quantity { get; set; }
     [Column("price")] public double Price { get; set; }
 
+    /// <summary>Trade timestamp in DB (DATETIME, but treated as UTC in code).</summary>
+    [Column("trade_time")] public DateTime TradeTimeUtc { get; set; }
+
     /// <summary>Optional per-trade realized PnL. Can be null if only tracked at worker level.</summary>
     [Column("realized_pnl")] public double? RealizedPnl { get; set; }
 
     [Column("notes")] public string? Notes { get; set; }
 
-    [Column("created_utc")] public DateTime CreatedUtc { get; set; }
+    [Column("created_at")] public DateTime CreatedAt { get; set; }
 }
 
 [Table("worker_stats")]
@@ -209,6 +219,9 @@ public sealed class NvdaTradingWorkerStats
     [Key, Column("id")] public long Id { get; set; }
 
     [Column("worker_id")] public int WorkerId { get; set; }
+
+    /// <summary>Snapshot timestamp (DB column `timestamp`). Treat as UTC.</summary>
+    [Column("timestamp")] public DateTime SnapshotUtc { get; set; }
 
     [Column("equity")] public double Equity { get; set; }
     [Column("cash")] public double Cash { get; set; }
@@ -219,9 +232,6 @@ public sealed class NvdaTradingWorkerStats
     [Column("open_positions")] public int OpenPositions { get; set; }
 
     [Column("total_trades")] public int TotalTrades { get; set; }
-
-    /// <summary>Snapshot timestamp in UTC (Python engine writes this, or MySQL default CURRENT_TIMESTAMP)</summary>
-    [Column("snapshot_utc")] public DateTime SnapshotUtc { get; set; }
 }
 
 [Table("trading_settings")]
