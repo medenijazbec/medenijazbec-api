@@ -5,6 +5,7 @@ using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
 using System;
 using System.Collections.Generic;
+using System.Data;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -1099,4 +1100,85 @@ public sealed class NvdaTradingController : ControllerBase
 
         return Ok(dto);
     }
+
+    /// <summary>
+    /// IP ↔ API key history report, backed by v_api_key_ip_history.
+    /// Shows which IPs each key has ever used and when they were last seen.
+    /// React: GET /api/trading/api-key-ip-history
+    /// </summary>
+    [HttpGet("~/api/trading/api-key-ip-history")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult<ApiKeyIpHistoryDto[]>> GetApiKeyIpHistory()
+    {
+        const string sql = @"
+        SELECT
+          history_id,
+          api_key_id,
+          provider_code,
+          key_label,
+          api_key,
+          is_active,
+          ip_address,
+          first_seen_at,
+          last_seen_at,
+          ip_burned,
+          ip_rate_limited_at,
+          ip_next_available_at,
+          daily_quota,
+          per_minute_quota,
+          calls_today
+        FROM v_api_key_ip_history
+        ORDER BY api_key_id, first_seen_at;
+    ";
+
+        var results = new List<ApiKeyIpHistoryDto>();
+
+        var conn = _tradingDb.Database.GetDbConnection();
+
+        try
+        {
+            if (conn.State != ConnectionState.Open)
+                await conn.OpenAsync();
+
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (await reader.ReadAsync())
+            {
+                var dto = new ApiKeyIpHistoryDto(
+                    HistoryId: reader.GetInt32(0),
+                    ApiKeyId: reader.GetInt32(1),
+                    ProviderCode: reader.GetString(2),
+                    KeyLabel: reader.IsDBNull(3) ? null : reader.GetString(3),
+                    ApiKey: reader.GetString(4),
+                    IsActive: reader.GetBoolean(5),
+                    IpAddress: reader.GetString(6),
+                    FirstSeenAt: reader.GetDateTime(7),
+                    LastSeenAt: reader.GetDateTime(8),
+                    IpBurned: reader.GetBoolean(9),
+                    IpRateLimitedAt: reader.IsDBNull(10)
+                        ? (DateTime?)null
+                        : reader.GetDateTime(10),
+                    IpNextAvailableAt: reader.IsDBNull(11)
+                        ? (DateTime?)null
+                        : reader.GetDateTime(11),
+                    DailyQuota: reader.IsDBNull(12) ? (int?)null : reader.GetInt32(12),
+                    PerMinuteQuota: reader.IsDBNull(13) ? (int?)null : reader.GetInt32(13),
+                    CallsToday: reader.GetInt32(14)
+                );
+
+                results.Add(dto);
+            }
+        }
+        finally
+        {
+            if (conn.State == ConnectionState.Open)
+                await conn.CloseAsync();
+        }
+
+        return Ok(results.ToArray());
+    }
+
+
 }

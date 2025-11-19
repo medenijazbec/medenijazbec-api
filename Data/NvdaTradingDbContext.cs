@@ -99,6 +99,23 @@ public sealed class NvdaTradingDbContext : DbContext
             .HasForeignKey(x => x.ProviderId);
     }
 }
+public sealed record ApiKeyIpHistoryDto(
+    int HistoryId,
+    int ApiKeyId,
+    string ProviderCode,
+    string? KeyLabel,
+    string ApiKey,
+    bool IsActive,
+    string IpAddress,
+    DateTime FirstSeenAt,
+    DateTime LastSeenAt,
+    bool IpBurned,
+    DateTime? IpRateLimitedAt,
+    DateTime? IpNextAvailableAt,
+    int? DailyQuota,
+    int? PerMinuteQuota,
+    int CallsToday
+);
 
 // =============== ENTITIES (snake_case mappings) ===============
 
