@@ -1,10 +1,12 @@
-﻿using System;
-using System.Linq;
-using System.Threading.Tasks;
-using honey_badger_api.Data;
+﻿using honey_badger_api.Data;
+using Mailjet.Client.Resources;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
 
 namespace honey_badger_api.Controllers;
 
@@ -22,6 +24,7 @@ public sealed class NvdaTradingController : ControllerBase
 
     // -----------------------------------------------------------------------
     // 1) SETTINGS: SYMBOL / TIMEFRAME / PROVIDER / CAPITAL / HISTORY
+    //    (single global row, Id=1)
     // -----------------------------------------------------------------------
 
     public sealed record TradingSettingsDto(
@@ -105,8 +108,8 @@ public sealed class NvdaTradingController : ControllerBase
             return BadRequest("historicalCandles must be > 0.");
 
         var provider = (req.dataProvider ?? string.Empty).Trim().ToLowerInvariant();
-        if (provider is not ("alpha" or "finnhub"))
-            return BadRequest("dataProvider must be 'alpha' or 'finnhub'.");
+        if (provider is not ("alpha" or "finnhub" or "twelvedata"))
+            return BadRequest("dataProvider must be 'alpha', 'finnhub' or 'twelvedata'.");
 
         s.Symbol = req.symbol.Trim().ToUpperInvariant();
         s.TimeframeCode = req.timeframeCode.Trim();
@@ -127,6 +130,147 @@ public sealed class NvdaTradingController : ControllerBase
             s.HistoricalCandles,
             s.UpdatedUtc
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // 1b) ADMIN: MULTI-ROW TRADING_SETTINGS (symbols / TFs / providers)
+    //      Routes are rooted as `/api/trading/...` to match the React admin
+    //      panel, but implemented in this controller.
+    // -----------------------------------------------------------------------
+
+    public sealed record TradingSettingRowDto(
+        int id,
+        string symbol,
+        string timeframeCode,
+        int timeframeMinutes,
+        string dataProvider,
+        double initialCapitalPerWorker,
+        int historicalCandles,
+        DateTime? updatedUtc
+    );
+
+    public sealed record CreateTradingSettingRequest(
+        string symbol,
+        string timeframeCode,
+        int timeframeMinutes,
+        string dataProvider,
+        double initialCapitalPerWorker,
+        int historicalCandles
+    );
+
+    /// <summary>
+    /// List all rows in trading_settings (admin view).
+    /// React: GET /api/trading/settings
+    /// </summary>
+    [HttpGet("~/api/trading/settings")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult<TradingSettingRowDto[]>> GetTradingSettingsRows()
+    {
+        var rows = await _tradingDb.TradingSettings
+            .AsNoTracking()
+            .OrderBy(s => s.Id)
+            .ToListAsync();
+
+        var dtos = rows
+            .Select(s => new TradingSettingRowDto(
+                s.Id,
+                s.Symbol,
+                s.TimeframeCode,
+                s.TimeframeMinutes,
+                s.DataProvider,
+                s.InitialCapitalPerWorker,
+                s.HistoricalCandles,
+                s.UpdatedUtc
+            ))
+            .ToArray();
+
+        return Ok(dtos);
+    }
+
+    /// <summary>
+    /// Create a new trading_settings row (symbol / timeframe / provider).
+    /// React: POST /api/trading/settings
+    /// </summary>
+    [HttpPost("~/api/trading/settings")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult<TradingSettingRowDto>> CreateTradingSetting(
+        [FromBody] CreateTradingSettingRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.symbol))
+            return BadRequest("Symbol is required.");
+        if (string.IsNullOrWhiteSpace(req.timeframeCode))
+            return BadRequest("timeframeCode is required.");
+        if (req.timeframeMinutes <= 0)
+            return BadRequest("timeframeMinutes must be > 0.");
+        if (req.historicalCandles <= 0)
+            return BadRequest("historicalCandles must be > 0.");
+
+        var provider = (req.dataProvider ?? string.Empty).Trim().ToLowerInvariant();
+        if (provider is not ("alpha" or "finnhub" or "twelvedata"))
+            return BadRequest("dataProvider must be 'alpha', 'finnhub' or 'twelvedata'.");
+
+        var symbol = req.symbol.Trim().ToUpperInvariant();
+        var tfCode = req.timeframeCode.Trim();
+
+        // Optional: avoid exact duplicates for (symbol, timeframeCode)
+        var exists = await _tradingDb.TradingSettings.AsNoTracking()
+            .AnyAsync(s =>
+                s.Symbol == symbol &&
+                s.TimeframeCode == tfCode &&
+                s.TimeframeMinutes == req.timeframeMinutes &&
+                s.DataProvider == provider);
+
+        if (exists)
+            return Conflict("A trading_settings row with the same symbol/timeframe/provider already exists.");
+
+        var now = DateTime.UtcNow;
+
+        var entity = new NvdaTradingSettings
+        {
+            Symbol = symbol,
+            TimeframeCode = tfCode,
+            TimeframeMinutes = req.timeframeMinutes,
+            DataProvider = provider,
+            InitialCapitalPerWorker = req.initialCapitalPerWorker,
+            HistoricalCandles = req.historicalCandles,
+            UpdatedUtc = now
+        };
+
+        _tradingDb.TradingSettings.Add(entity);
+        await _tradingDb.SaveChangesAsync();
+
+        var dto = new TradingSettingRowDto(
+            entity.Id,
+            entity.Symbol,
+            entity.TimeframeCode,
+            entity.TimeframeMinutes,
+            entity.DataProvider,
+            entity.InitialCapitalPerWorker,
+            entity.HistoricalCandles,
+            entity.UpdatedUtc
+        );
+
+        return Ok(dto);
+    }
+
+    /// <summary>
+    /// Delete a trading_settings row by Id.
+    /// React: DELETE /api/trading/settings/{id}
+    /// </summary>
+    [HttpDelete("~/api/trading/settings/{id:int}")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult> DeleteTradingSetting(int id)
+    {
+        var row = await _tradingDb.TradingSettings
+            .FirstOrDefaultAsync(s => s.Id == id);
+
+        if (row == null)
+            return NotFound();
+
+        _tradingDb.TradingSettings.Remove(row);
+        await _tradingDb.SaveChangesAsync();
+
+        return NoContent();
     }
 
     // -----------------------------------------------------------------------
@@ -384,29 +528,46 @@ public sealed class NvdaTradingController : ControllerBase
     );
 
     /// <summary>
-    /// Recent candles (OHLCV) plus (optionally) a subset of features from `candle_features`
-    /// for the currently configured SYMBOL + TIMEFRAME.
-    /// Right now we just return basic OHLCV + a crude bullish flag.
+    /// Recent candles (OHLCV) plus (optionally) a subset of features from `candle_features`.
+    ///
+    /// Supports:
+    ///   - /api/nvda-trading/candles?limit=200                 (uses global settings row)
+    ///   - /api/nvda-trading/candles?symbol=NVDA&timeframeCode=1m&limit=300
     /// </summary>
     [HttpGet("candles")]
     public async Task<ActionResult<CandleWithFeaturesDto[]>> GetRecentCandles(
+        [FromQuery] string? symbol = null,
+        [FromQuery] string? timeframeCode = null,
         [FromQuery] int limit = 200)
     {
         if (limit <= 0) limit = 200;
         if (limit > 1000) limit = 1000;
 
-        var settings = await EnsureSettingsRowAsync();
+        string effectiveSymbol;
+        string effectiveTimeframeCode;
 
-        var symbol = await _tradingDb.Symbols
+        if (!string.IsNullOrWhiteSpace(symbol) && !string.IsNullOrWhiteSpace(timeframeCode))
+        {
+            effectiveSymbol = symbol.Trim().ToUpperInvariant();
+            effectiveTimeframeCode = timeframeCode.Trim();
+        }
+        else
+        {
+            var settings = await EnsureSettingsRowAsync();
+            effectiveSymbol = settings.Symbol;
+            effectiveTimeframeCode = settings.TimeframeCode;
+        }
+
+        var symbolEntity = await _tradingDb.Symbols
             .AsNoTracking()
-            .FirstOrDefaultAsync(s => s.Symbol == settings.Symbol);
+            .FirstOrDefaultAsync(s => s.Symbol == effectiveSymbol);
 
-        if (symbol == null)
+        if (symbolEntity == null)
             return Ok(Array.Empty<CandleWithFeaturesDto>());
 
         var timeframe = await _tradingDb.Timeframes
             .AsNoTracking()
-            .FirstOrDefaultAsync(tf => tf.Code == settings.TimeframeCode);
+            .FirstOrDefaultAsync(tf => tf.Code == effectiveTimeframeCode);
 
         if (timeframe == null)
             return Ok(Array.Empty<CandleWithFeaturesDto>());
@@ -414,7 +575,7 @@ public sealed class NvdaTradingController : ControllerBase
         // Use the candle entity directly; no navs are configured here.
         var rawCandles = await _tradingDb.Candles
             .AsNoTracking()
-            .Where(c => c.SymbolId == symbol.Id && c.TimeframeId == timeframe.Id)
+            .Where(c => c.SymbolId == symbolEntity.Id && c.TimeframeId == timeframe.Id)
             .OrderByDescending(c => c.OpenTime)
             .Take(limit)
             .ToListAsync();
@@ -521,5 +682,421 @@ public sealed class NvdaTradingController : ControllerBase
             .ToListAsync();
 
         return Ok(trades);
+    }
+
+    // -----------------------------------------------------------------------
+    // 6) ADMIN: API PROVIDERS + API KEYS (api_providers / api_keys tables)
+    //      Routes are rooted at `/api/trading/...` for the React admin panel.
+    // -----------------------------------------------------------------------
+
+    public sealed record ApiProviderDto(
+        int id,
+        string code,
+        string name,
+        string? baseUrl,
+        string? timezone,
+        int? dailyQuotaDefault,
+        int? perMinuteQuotaDefault,
+        DateTime createdAt
+    );
+
+    public sealed record CreateApiProviderRequest(
+        string code,
+        string name,
+        string? baseUrl,
+        string? timezone,
+        int? dailyQuotaDefault,
+        int? perMinuteQuotaDefault
+    );
+
+    /// <summary>
+    /// List all api_providers.
+    /// React: GET /api/trading/api-providers
+    /// </summary>
+    [HttpGet("~/api/trading/api-providers")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult<ApiProviderDto[]>> GetApiProviders()
+    {
+        var providers = await _tradingDb.ApiProviders
+            .AsNoTracking()
+            .OrderBy(p => p.Id)
+            .ToListAsync();
+
+        var dtos = providers
+            .Select(p => new ApiProviderDto(
+                p.Id,
+                p.Code,
+                p.Name,
+                p.BaseUrl,
+                p.Timezone,
+                p.DailyQuotaDefault,
+                p.PerMinuteQuotaDefault,
+                p.CreatedAt
+            ))
+            .ToArray();
+
+        return Ok(dtos);
+    }
+
+    /// <summary>
+    /// Create a new api_providers row.
+    /// React: POST /api/trading/api-providers
+    /// </summary>
+    [HttpPost("~/api/trading/api-providers")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult<ApiProviderDto>> CreateApiProvider(
+        [FromBody] CreateApiProviderRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.code))
+            return BadRequest("code is required.");
+        if (string.IsNullOrWhiteSpace(req.name))
+            return BadRequest("name is required.");
+
+        var code = req.code.Trim().ToLowerInvariant();
+        var name = req.name.Trim();
+
+        var exists = await _tradingDb.ApiProviders.AsNoTracking()
+            .AnyAsync(p => p.Code == code);
+
+        if (exists)
+            return Conflict("An API provider with this code already exists.");
+
+        var now = DateTime.UtcNow;
+
+        var entity = new ApiProvider
+        {
+            Code = code,
+            Name = name,
+            BaseUrl = string.IsNullOrWhiteSpace(req.baseUrl) ? null : req.baseUrl.Trim(),
+            Timezone = string.IsNullOrWhiteSpace(req.timezone) ? "UTC" : req.timezone.Trim(),
+            DailyQuotaDefault = req.dailyQuotaDefault,
+            PerMinuteQuotaDefault = req.perMinuteQuotaDefault,
+            CreatedAt = now
+        };
+
+        _tradingDb.ApiProviders.Add(entity);
+        await _tradingDb.SaveChangesAsync();
+
+        var dto = new ApiProviderDto(
+            entity.Id,
+            entity.Code,
+            entity.Name,
+            entity.BaseUrl,
+            entity.Timezone,
+            entity.DailyQuotaDefault,
+            entity.PerMinuteQuotaDefault,
+            entity.CreatedAt
+        );
+
+        return Ok(dto);
+    }
+
+    public sealed record ApiKeyDto(
+        int id,
+        int providerId,
+        string? providerCode,
+        string apiKey,
+        string? label,
+        bool isActive,
+        int? dailyQuota,
+        int? perMinuteQuota,
+        int callsToday,
+        DateTime? quotaDate,
+        DateTime? windowStartedAt,
+        int windowCalls,
+        DateTime? rateLimitedAt,
+        DateTime? nextAvailableAt,
+        string? ipAddress,
+        bool ipBurned,
+        DateTime? ipRateLimitedAt,
+        DateTime? ipNextAvailableAt,
+        DateTime createdAt,
+        DateTime updatedAt
+    );
+
+    public sealed record CreateApiKeyRequest(
+        int providerId,
+        string apiKey,
+        string? label,
+        bool isActive,
+        int? dailyQuota,
+        int? perMinuteQuota
+    );
+
+    /// <summary>
+    /// List all api_keys with provider code attached.
+    /// React: GET /api/trading/api-keys
+    /// </summary>
+    [HttpGet("~/api/trading/api-keys")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult<ApiKeyDto[]>> GetApiKeys()
+    {
+        var query =
+            from k in _tradingDb.ApiKeys.AsNoTracking()
+            join p in _tradingDb.ApiProviders.AsNoTracking()
+                on k.ProviderId equals p.Id into pJoin
+            from p in pJoin.DefaultIfEmpty()
+            orderby k.Id
+            select new { k, ProviderCode = p != null ? p.Code : null };
+
+        var rows = await query.ToListAsync();
+
+        var dtos = rows
+            .Select(x => new ApiKeyDto(
+                x.k.Id,
+                x.k.ProviderId,
+                x.ProviderCode,
+                x.k.apiKey,
+                x.k.Label,
+                x.k.IsActive,
+                x.k.DailyQuota,
+                x.k.PerMinuteQuota,
+                x.k.CallsToday,
+                x.k.QuotaDate,
+                x.k.WindowStartedAt,
+                x.k.WindowCalls,
+                x.k.RateLimitedAt,
+                x.k.NextAvailableAt,
+                x.k.IpAddress,
+                x.k.IpBurned,
+                x.k.IpRateLimitedAt,
+                x.k.IpNextAvailableAt,
+                x.k.CreatedAt,
+                x.k.UpdatedAt
+            ))
+            .ToArray();
+
+        return Ok(dtos);
+    }
+
+    /// <summary>
+    /// Create a new api_keys row.
+    /// React: POST /api/trading/api-keys
+    /// </summary>
+    [HttpPost("~/api/trading/api-keys")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult<ApiKeyDto>> CreateApiKey(
+        [FromBody] CreateApiKeyRequest req)
+    {
+        if (req.providerId <= 0)
+            return BadRequest("providerId is required.");
+        if (string.IsNullOrWhiteSpace(req.apiKey))
+            return BadRequest("apiKey is required.");
+
+        var provider = await _tradingDb.ApiProviders
+            .AsNoTracking()
+            .FirstOrDefaultAsync(p => p.Id == req.providerId);
+
+        if (provider == null)
+            return BadRequest("Unknown providerId.");
+
+        var keyValue = req.apiKey.Trim();
+
+        var exists = await _tradingDb.ApiKeys.AsNoTracking()
+            .AnyAsync(k => k.apiKey == keyValue && k.ProviderId == req.providerId);
+
+        if (exists)
+            return Conflict("This API key already exists for the selected provider.");
+
+        var now = DateTime.UtcNow;
+
+        var entity = new ApiKey
+        {
+            ProviderId = req.providerId,
+            apiKey = keyValue,
+            Label = string.IsNullOrWhiteSpace(req.label) ? null : req.label.Trim(),
+            IsActive = req.isActive,
+            DailyQuota = req.dailyQuota,
+            PerMinuteQuota = req.perMinuteQuota,
+            CallsToday = 0,
+            QuotaDate = null,
+            WindowStartedAt = null,
+            WindowCalls = 0,
+            RateLimitedAt = null,
+            NextAvailableAt = null,
+            IpAddress = null,
+            IpBurned = false,
+            IpRateLimitedAt = null,
+            IpNextAvailableAt = null,
+            CreatedAt = now,
+            UpdatedAt = now
+        };
+
+        _tradingDb.ApiKeys.Add(entity);
+        await _tradingDb.SaveChangesAsync();
+
+        var dto = new ApiKeyDto(
+            entity.Id,
+            entity.ProviderId,
+            provider.Code,
+            entity.apiKey,
+            entity.Label,
+            entity.IsActive,
+            entity.DailyQuota,
+            entity.PerMinuteQuota,
+            entity.CallsToday,
+            entity.QuotaDate,
+            entity.WindowStartedAt,
+            entity.WindowCalls,
+            entity.RateLimitedAt,
+            entity.NextAvailableAt,
+            entity.IpAddress,
+            entity.IpBurned,
+            entity.IpRateLimitedAt,
+            entity.IpNextAvailableAt,
+            entity.CreatedAt,
+            entity.UpdatedAt
+        );
+
+        return Ok(dto);
+    }
+
+    // -----------------------------------------------------------------------
+    // 7) ADMIN: TRADING INFRA STATS (symbols / keys / workers)
+    // -----------------------------------------------------------------------
+
+    public sealed record TradingInfraSymbolDto(
+        int id,
+        string symbol,
+        string timeframeCode,
+        int timeframeMinutes,
+        string dataProvider,
+        int historicalCandles,
+        DateTime? updatedUtc
+    );
+
+    public sealed record RateLimitedKeyDto(
+        int id,
+        string? providerCode,
+        string? label,
+        DateTime? nextAvailableAt,
+        DateTime? ipNextAvailableAt,
+        int? secondsUntilKeyAvailable,
+        int? secondsUntilIpAvailable
+    );
+
+    public sealed record TradingInfraStatsDto(
+        DateTime generatedAtUtc,
+        TradingInfraSymbolDto[] symbols,
+        int totalWorkers,
+        int activeWorkers,
+        int totalApiProviders,
+        int totalApiKeys,
+        int activeApiKeys,
+        int keysCurrentlyRateLimited,
+        RateLimitedKeyDto[] rateLimitedKeys
+    );
+
+    /// <summary>
+    /// Summary stats for trading infra: configured symbols, workers, API keys,
+    /// and which keys are currently rate-limited (with remaining cooldown).
+    ///
+    /// React can hit: GET /api/trading/infra-stats
+    /// </summary>
+    [HttpGet("~/api/trading/infra-stats")]
+    [Authorize(Roles = "Admin")]
+    public async Task<ActionResult<TradingInfraStatsDto>> GetTradingInfraStats()
+    {
+        var nowUtc = DateTime.UtcNow;
+
+        // All trading_settings rows (symbols being fetched by Python/Tor workers)
+        var settingsRows = await _tradingDb.TradingSettings
+            .AsNoTracking()
+            .OrderBy(s => s.Id)
+            .ToListAsync();
+
+        var symbols = settingsRows
+            .Select(s => new TradingInfraSymbolDto(
+                s.Id,
+                s.Symbol,
+                s.TimeframeCode,
+                s.TimeframeMinutes,
+                s.DataProvider,
+                s.HistoricalCandles,
+                s.UpdatedUtc
+            ))
+            .ToArray();
+
+        // Workers
+        var workers = await _tradingDb.Workers.AsNoTracking().ToListAsync();
+        int totalWorkers = workers.Count;
+
+        // "Active" workers = any with a stats snapshot in the last 10 minutes
+        var activeCutoff = nowUtc.AddMinutes(-10);
+        var activeWorkerIds = await _tradingDb.WorkerStats.AsNoTracking()
+            .Where(ws => ws.SnapshotUtc >= activeCutoff)
+            .Select(ws => ws.WorkerId)
+            .Distinct()
+            .ToListAsync();
+        int activeWorkers = activeWorkerIds.Count;
+
+        // Providers
+        var providers = await _tradingDb.ApiProviders.AsNoTracking().ToListAsync();
+        int totalApiProviders = providers.Count;
+
+        // Keys + provider code
+        var keyQuery =
+            from k in _tradingDb.ApiKeys.AsNoTracking()
+            join p in _tradingDb.ApiProviders.AsNoTracking()
+                on k.ProviderId equals p.Id into pJoin
+            from p in pJoin.DefaultIfEmpty()
+            select new { k, ProviderCode = p != null ? p.Code : null };
+
+        var keyRows = await keyQuery.ToListAsync();
+        int totalApiKeys = keyRows.Count;
+        int activeApiKeys = keyRows.Count(x => x.k.IsActive);
+
+        // Keys currently rate-limited (key-level or IP-level)
+        var limitedKeys = new List<RateLimitedKeyDto>();
+
+        foreach (var x in keyRows)
+        {
+            var key = x.k;
+            DateTime? keyNext = key.NextAvailableAt;
+            DateTime? ipNext = key.IpNextAvailableAt;
+
+            bool isLimited =
+                (keyNext.HasValue && keyNext.Value > nowUtc) ||
+                (ipNext.HasValue && ipNext.Value > nowUtc);
+
+            if (!isLimited)
+                continue;
+
+            int? keySeconds = null;
+            if (keyNext.HasValue && keyNext.Value > nowUtc)
+            {
+                keySeconds = (int)Math.Max(0, (keyNext.Value - nowUtc).TotalSeconds);
+            }
+
+            int? ipSeconds = null;
+            if (ipNext.HasValue && ipNext.Value > nowUtc)
+            {
+                ipSeconds = (int)Math.Max(0, (ipNext.Value - nowUtc).TotalSeconds);
+            }
+
+            limitedKeys.Add(new RateLimitedKeyDto(
+                key.Id,
+                x.ProviderCode,
+                key.Label,
+                keyNext,
+                ipNext,
+                keySeconds,
+                ipSeconds
+            ));
+        }
+
+        var dto = new TradingInfraStatsDto(
+            nowUtc,
+            symbols,
+            totalWorkers,
+            activeWorkers,
+            totalApiProviders,
+            totalApiKeys,
+            activeApiKeys,
+            limitedKeys.Count,
+            limitedKeys.ToArray()
+        );
+
+        return Ok(dto);
     }
 }

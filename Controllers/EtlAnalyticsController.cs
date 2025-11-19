@@ -1024,13 +1024,13 @@ DELETE FROM tor_rate_limited_ips;
     //
     // MySQL precedence:
     // (id >= 35584 AND status='completed') OR status='done'
-    //
+    /// (kj.Id >= 35584 && kj.Status == "completed") ||
     [HttpGet("jobs/completed-counter")]
     public async Task<IActionResult> CompletedCounter()
     {
         var completedCount = await _db.KeywordJobs.AsNoTracking()
             .Where(kj =>
-                (kj.Id >= 35584 && kj.Status == "completed") ||
+                (kj.Status == "completed") ||
                 kj.Status == "done")
             .CountAsync();
 

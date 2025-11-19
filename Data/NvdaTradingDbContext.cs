@@ -9,6 +9,7 @@ namespace honey_badger_api.Data;
 /// Third DB: candle-level trading lab (trading_candles MySQL).
 /// Mirrors the Python NVDA-candle-trading schema:
 ///   symbols, timeframes, workers, candles, candle_features, trades, worker_stats, trading_settings
+/// plus api_providers + api_keys for rate-limited data providers.
 /// </summary>
 public sealed class NvdaTradingDbContext : DbContext
 {
@@ -22,6 +23,10 @@ public sealed class NvdaTradingDbContext : DbContext
     public DbSet<NvdaTradingTrade> Trades => Set<NvdaTradingTrade>();
     public DbSet<NvdaTradingWorkerStats> WorkerStats => Set<NvdaTradingWorkerStats>();
     public DbSet<NvdaTradingSettings> TradingSettings => Set<NvdaTradingSettings>();
+
+    // NEW: API providers + keys for the admin trading infra panel
+    public DbSet<ApiProvider> ApiProviders => Set<ApiProvider>();
+    public DbSet<ApiKey> ApiKeys => Set<ApiKey>();
 
     protected override void OnModelCreating(ModelBuilder b)
     {
@@ -64,6 +69,34 @@ public sealed class NvdaTradingDbContext : DbContext
         b.Entity<NvdaTradingSettings>()
             .HasIndex(x => x.Id)
             .IsUnique();
+
+        // ---------- NEW: api_providers / api_keys indexes ----------
+
+        // Unique provider code (e.g. "alpha_vantage", "twelvedata")
+        b.Entity<ApiProvider>()
+            .HasIndex(x => x.Code)
+            .IsUnique();
+
+        // Keys: unique per (provider_id, api_key)
+        b.Entity<ApiKey>()
+            .HasIndex(x => new { x.ProviderId, x.apiKey })
+            .IsUnique();
+
+        b.Entity<ApiKey>()
+            .HasIndex(x => x.ProviderId);
+
+        // Helpful for finding currently rate-limited keys
+        b.Entity<ApiKey>()
+            .HasIndex(x => x.NextAvailableAt);
+
+        b.Entity<ApiKey>()
+            .HasIndex(x => x.IpNextAvailableAt);
+
+        // FK provider_id -> api_providers.id (no nav properties needed)
+        b.Entity<ApiKey>()
+            .HasOne<ApiProvider>()
+            .WithMany()
+            .HasForeignKey(x => x.ProviderId);
     }
 }
 
@@ -254,4 +287,84 @@ public sealed class NvdaTradingSettings
     [Column("historical_candles")] public int HistoricalCandles { get; set; } = 200;
 
     [Column("updated_utc")] public DateTime UpdatedUtc { get; set; }
+}
+
+/// <summary>
+/// API data providers: Alpha Vantage, Twelve Data, Finnhub, etc.
+/// </summary>
+[Table("api_providers")]
+public sealed class ApiProvider
+{
+    [Key, Column("id")] public int Id { get; set; }
+
+    /// <summary>Short code, e.g. "alpha_vantage", "twelvedata".</summary>
+    [Column("code")] public string Code { get; set; } = "";
+
+    /// <summary>Human-readable provider name.</summary>
+    [Column("name")] public string Name { get; set; } = "";
+
+    /// <summary>Base URL, e.g. https://api.twelvedata.com</summary>
+    [Column("base_url")] public string? BaseUrl { get; set; }
+
+    /// <summary>Timezone identifier, e.g. "America/New_York".</summary>
+    [Column("timezone")] public string? Timezone { get; set; }
+
+    /// <summary>Default daily quota for new keys of this provider.</summary>
+    [Column("daily_quota_default")] public int? DailyQuotaDefault { get; set; }
+
+    /// <summary>Default per-minute quota for new keys of this provider.</summary>
+    [Column("per_minute_quota_default")] public int? PerMinuteQuotaDefault { get; set; }
+
+    [Column("created_at")] public DateTime CreatedAt { get; set; }
+}
+
+/// <summary>
+/// API keys per provider with quota / rate-limit tracking.
+/// </summary>
+[Table("api_keys")]
+public sealed class ApiKey
+{
+    [Key, Column("id")] public int Id { get; set; }
+
+    [Column("provider_id")] public int ProviderId { get; set; }
+
+    [Column("api_key")] public string apiKey { get; set; } = "";
+
+    [Column("label")] public string? Label { get; set; }
+
+    [Column("is_active")] public bool IsActive { get; set; }
+
+    [Column("daily_quota")] public int? DailyQuota { get; set; }
+
+    [Column("per_minute_quota")] public int? PerMinuteQuota { get; set; }
+
+    [Column("calls_today")] public int CallsToday { get; set; }
+
+    /// <summary>Date for which calls_today applies (UTC date).</summary>
+    [Column("quota_date")] public DateTime? QuotaDate { get; set; }
+
+    /// <summary>Start of the current per-minute window.</summary>
+    [Column("window_started_at")] public DateTime? WindowStartedAt { get; set; }
+
+    [Column("window_calls")] public int WindowCalls { get; set; }
+
+    /// <summary>Key-level rate limiting timestamp.</summary>
+    [Column("rate_limited_at")] public DateTime? RateLimitedAt { get; set; }
+
+    /// <summary>When this key is allowed to make a new call again.</summary>
+    [Column("next_available_at")] public DateTime? NextAvailableAt { get; set; }
+
+    /// <summary>IP assigned to this key (enforced 1 key ↔ 1 IP).</summary>
+    [Column("ip_address")] public string? IpAddress { get; set; }
+
+    /// <summary>If true, this IP is burned and should not be reused.</summary>
+    [Column("ip_burned")] public bool IpBurned { get; set; }
+
+    [Column("ip_rate_limited_at")] public DateTime? IpRateLimitedAt { get; set; }
+
+    [Column("ip_next_available_at")] public DateTime? IpNextAvailableAt { get; set; }
+
+    [Column("created_at")] public DateTime CreatedAt { get; set; }
+
+    [Column("updated_at")] public DateTime UpdatedAt { get; set; }
 }
