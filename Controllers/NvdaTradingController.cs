@@ -6,6 +6,7 @@ using Microsoft.EntityFrameworkCore;
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Data.Common;
 using System.Linq;
 using System.Threading.Tasks;
 
@@ -1101,6 +1102,24 @@ public sealed class NvdaTradingController : ControllerBase
         return Ok(dto);
     }
 
+    public sealed record ApiKeyIpHistoryDto(
+        int HistoryId,
+        int ApiKeyId,
+        string ProviderCode,
+        string? KeyLabel,
+        string ApiKey,
+        bool IsActive,
+        string IpAddress,
+        DateTime FirstSeenAt,
+        DateTime LastSeenAt,
+        bool IpBurned,
+        DateTime? IpRateLimitedAt,
+        DateTime? IpNextAvailableAt,
+        int? DailyQuota,
+        int? PerMinuteQuota,
+        int CallsToday
+    );
+
     /// <summary>
     /// IP ↔ API key history report, backed by v_api_key_ip_history.
     /// Shows which IPs each key has ever used and when they were last seen.
@@ -1180,5 +1199,645 @@ public sealed class NvdaTradingController : ControllerBase
         return Ok(results.ToArray());
     }
 
+    // -----------------------------------------------------------------------
+    // X) MARKET CALENDAR HELPERS + PROVIDER CADENCE
+    // -----------------------------------------------------------------------
 
+    public sealed record NextInsertScheduleDto(
+        string symbol,
+        string timeframeCode,
+        string provider,
+        DateTime? lastInsertUtc,
+        DateTime nextInsertUtc,
+        int secondsUntilNext
+    );
+
+    // Cadences (mirror of your Python/env)
+    private const int TD_POLL_SECONDS = 30;
+    private const int AV_WEEKDAY_CLOSED_POLL_SECONDS = 3300;
+    private const int AV_WEEKEND_POLL_SECONDS = 7200;
+
+    // Pre-open slots in US/Eastern (09:00, 09:10, 09:20, 09:29)
+    private static readonly (int h, int m)[] NEAR_OPEN_SLOTS =
+    {
+        (9, 0), (9, 10), (9, 20), (9, 29)
+    };
+
+    private static TimeZoneInfo TzEastern =>
+        TryGetTimeZone("America/New_York", "Eastern Standard Time");
+
+    // --- US market holidays (observed) and helpers (Eastern local dates) ---
+
+    private static DateOnly Observed(DateOnly d)
+    {
+        // Sat -> Fri, Sun -> Mon
+        return d.DayOfWeek switch
+        {
+            DayOfWeek.Saturday => d.AddDays(-1),
+            DayOfWeek.Sunday => d.AddDays(1),
+            _ => d
+        };
+    }
+
+    private static DateOnly NthWeekdayOfMonth(int year, int month, DayOfWeek weekday, int n)
+    {
+        var first = new DateOnly(year, month, 1);
+        int offset = ((int)weekday - (int)first.DayOfWeek + 7) % 7;
+        return first.AddDays(offset + (n - 1) * 7);
+    }
+
+    private static DateOnly LastWeekdayOfMonth(int year, int month, DayOfWeek weekday)
+    {
+        var last = new DateOnly(year, month, DateTime.DaysInMonth(year, month));
+        int offset = ((int)last.DayOfWeek - (int)weekday + 7) % 7;
+        return last.AddDays(-offset);
+    }
+
+    // Meeus/Jones/Butcher for Easter Sunday
+    private static DateOnly EasterSunday(int year)
+    {
+        int a = year % 19;
+        int b = year / 100;
+        int c = year % 100;
+        int d = b / 4;
+        int e = b % 4;
+        int f = (b + 8) / 25;
+        int g = (b - f + 1) / 3;
+        int h = (19 * a + b - d - g + 15) % 30;
+        int i = c / 4;
+        int k = c % 4;
+        int l = (32 + 2 * e + 2 * i - h - k) % 7;
+        int m = (a + 11 * h + 22 * l) / 451;
+        int month = (h + l - 7 * m + 114) / 31; // 3=Mar, 4=Apr
+        int day = ((h + l - 7 * m + 114) % 31) + 1;
+        return new DateOnly(year, month, day);
+    }
+
+    // Good Friday = 2 days before Easter Sunday
+    private static DateOnly GoodFriday(int year) => EasterSunday(year).AddDays(-2);
+
+    private static HashSet<DateOnly> UsMarketHolidaysEasternDates(int year)
+    {
+        var set = new HashSet<DateOnly>();
+
+        // Observed fixed-date
+        set.Add(Observed(new DateOnly(year, 1, 1)));   // New Year's Day
+        set.Add(Observed(new DateOnly(year, 6, 19)));  // Juneteenth
+        set.Add(Observed(new DateOnly(year, 7, 4)));   // Independence Day
+        set.Add(Observed(new DateOnly(year, 12, 25))); // Christmas
+
+        // Floating
+        set.Add(NthWeekdayOfMonth(year, 1, DayOfWeek.Monday, 3));   // MLK Day
+        set.Add(NthWeekdayOfMonth(year, 2, DayOfWeek.Monday, 3));   // Presidents' Day
+        set.Add(GoodFriday(year));                                   // Good Friday
+        set.Add(LastWeekdayOfMonth(year, 5, DayOfWeek.Monday));     // Memorial Day
+        set.Add(NthWeekdayOfMonth(year, 9, DayOfWeek.Monday, 1));   // Labor Day
+        set.Add(NthWeekdayOfMonth(year, 11, DayOfWeek.Thursday, 4)); // Thanksgiving
+
+        return set;
+    }
+
+    private static bool IsUsHolidayEastern(DateTime easternLocal)
+    {
+        var y = easternLocal.Year;
+        var holidays = UsMarketHolidaysEasternDates(y);
+        return holidays.Contains(DateOnly.FromDateTime(easternLocal.Date));
+    }
+
+    private static bool IsTradingDayEastern(DateTime easternLocal)
+    {
+        if (easternLocal.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+            return false;
+        if (IsUsHolidayEastern(easternLocal))
+            return false;
+        return true;
+    }
+
+    private static (DateTime openLocal, DateTime closeLocal) SessionBoundsEastern(DateTime easternLocalDateTime)
+    {
+        var d = easternLocalDateTime.Date;
+        var open = new DateTime(d.Year, d.Month, d.Day, 9, 30, 0, DateTimeKind.Unspecified);  // 09:30
+        var close = new DateTime(d.Year, d.Month, d.Day, 16, 0, 0, DateTimeKind.Unspecified); // 16:00
+        return (open, close);
+    }
+
+    private static bool IsUsMarketOpenUtc(DateTime nowUtc)
+    {
+        var easternNow = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, TzEastern);
+        if (!IsTradingDayEastern(easternNow)) return false;
+        var (openLocal, closeLocal) = SessionBoundsEastern(easternNow);
+        var openUtc = TimeZoneInfo.ConvertTimeToUtc(openLocal, TzEastern);
+        var closeUtc = TimeZoneInfo.ConvertTimeToUtc(closeLocal, TzEastern);
+        return nowUtc >= openUtc && nowUtc <= closeUtc;
+    }
+
+    private static bool IsPreOpenSlotEastern(DateTime easternNow)
+    {
+        int hh = easternNow.Hour;
+        int mm = easternNow.Minute;
+        foreach (var s in NEAR_OPEN_SLOTS)
+        {
+            if (s.h == hh && s.m == mm) return true;
+        }
+        return false;
+    }
+
+    private static string NormalizeProvider(string? p)
+    {
+        if (string.IsNullOrWhiteSpace(p)) return "alpha";
+        var s = p.Trim().ToLowerInvariant();
+        if (s.Contains("twelve")) return "twelvedata";
+        if (s.Contains("alpha")) return "alpha";
+        return s;
+    }
+
+    private static int ComputePollIntervalSeconds(string provider, DateTime nowUtc)
+    {
+        var prov = NormalizeProvider(provider);
+        if (prov == "twelvedata") return TD_POLL_SECONDS;
+
+        // Alpha Vantage fallback cadences
+        var easternNow = TimeZoneInfo.ConvertTimeFromUtc(nowUtc, TzEastern);
+
+        if (!IsTradingDayEastern(easternNow)) return AV_WEEKEND_POLL_SECONDS; // weekend/holiday
+        if (IsUsMarketOpenUtc(nowUtc) || IsPreOpenSlotEastern(easternNow))
+            return TD_POLL_SECONDS; // snappy if somehow alpha is active while open / near-open
+        return AV_WEEKDAY_CLOSED_POLL_SECONDS; // closed on a weekday
+    }
+
+    private static string DecideActiveProvider(DateTime nowUtc)
+    {
+        // Rule: open market -> Twelve Data ; closed market -> Alpha Vantage.
+        return IsUsMarketOpenUtc(nowUtc) ? "twelvedata" : "alpha";
+    }
+
+    // -----------------------------------------------------------------------
+    // X.1) FETCH-STATUS (authoritative snapshot row)
+    // -----------------------------------------------------------------------
+
+    public sealed record FetchStatusDto(
+        string symbol,
+        string timeframeCode,
+        int timeframeMinutes,
+        string providerCurrent,          // reported by worker row (or derived if missing)
+        string providerShouldBe,         // based on market clock right now
+        DateTime? lastProviderChangeAt,
+        string? workerName,
+
+        DateTime? lastFetchStartedAt,
+        DateTime? lastFetchFinishedAt,
+        DateTime? previousFetchFinishedAt,
+        string? lastFetchStatus,
+        int? lastHttpStatus,
+        int? lastRowsInserted,
+        string? lastError,
+
+        DateTime? lastOpenTime,
+        DateTime? lastInsertCreatedAt,
+
+        DateTime nowUtc,
+        DateTime nextInsertUtc,
+        int secondsUntilNext,
+
+        DateTime? nextInsertDueAt,       // if the row already stores an expectation
+        int? computedPollSeconds         // last computed poll seconds written by backend
+    );
+
+    [HttpGet("~/api/trading/fetch-status")]
+    public async Task<ActionResult<FetchStatusDto>> GetFetchStatus(
+        [FromQuery] string? symbol = null,
+        [FromQuery] string? timeframeCode = null)
+    {
+        var settingsGlobal = await EnsureSettingsRowAsync();
+
+        string effectiveSymbol = !string.IsNullOrWhiteSpace(symbol)
+            ? symbol.Trim().ToUpperInvariant()
+            : settingsGlobal.Symbol;
+
+        string effectiveTfCode = !string.IsNullOrWhiteSpace(timeframeCode)
+            ? timeframeCode.Trim()
+            : settingsGlobal.TimeframeCode;
+
+        // Resolve symbol/timeframe
+        var symbolEntity = await _tradingDb.Symbols
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Symbol == effectiveSymbol);
+
+        var timeframe = await _tradingDb.Timeframes
+            .AsNoTracking()
+            .FirstOrDefaultAsync(tf => tf.Code == effectiveTfCode);
+
+        if (symbolEntity == null || timeframe == null)
+            return NotFound("Unknown symbol/timeframe.");
+
+        var nowUtc = DateTime.UtcNow;
+
+        // Pull current fetch_status row if present
+        string? providerCurrent = null;
+        string? workerName = null;
+        DateTime? lastProviderChangeAt = null;
+        DateTime? lastFetchStartedAt = null;
+        DateTime? lastFetchFinishedAt = null;
+        DateTime? previousFetchFinishedAt = null;
+        string? lastFetchStatus = null;
+        int? lastHttpStatus = null;
+        int? lastRowsInserted = null;
+        string? lastError = null;
+        DateTime? lastOpenTime = null;
+        DateTime? lastInsertCreatedAt = null;
+        DateTime? nextInsertDueAt = null;
+        int? computedPollSeconds = null;
+
+        var conn = _tradingDb.Database.GetDbConnection();
+        await conn.OpenAsync();
+        try
+        {
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"
+SELECT provider_current, last_provider_change_at, worker_name,
+       last_fetch_started_at, last_fetch_finished_at, previous_fetch_finished_at,
+       last_fetch_status, last_http_status, last_rows_inserted, last_error,
+       last_open_time, last_insert_created_at, next_insert_due_at, computed_poll_seconds
+FROM fetch_status
+WHERE symbol_id = @sid AND timeframe_id = @tid
+LIMIT 1;
+";
+                AddParam(cmd, "@sid", symbolEntity.Id);
+                AddParam(cmd, "@tid", timeframe.Id);
+
+                using var r = await cmd.ExecuteReaderAsync();
+                if (await r.ReadAsync())
+                {
+                    providerCurrent = r.IsDBNull(0) ? null : NormalizeProvider(r.GetString(0));
+                    lastProviderChangeAt = r.IsDBNull(1) ? null : r.GetDateTime(1);
+                    workerName = r.IsDBNull(2) ? null : r.GetString(2);
+
+                    lastFetchStartedAt = r.IsDBNull(3) ? null : r.GetDateTime(3);
+                    lastFetchFinishedAt = r.IsDBNull(4) ? null : r.GetDateTime(4);
+                    previousFetchFinishedAt = r.IsDBNull(5) ? null : r.GetDateTime(5);
+
+                    lastFetchStatus = r.IsDBNull(6) ? null : r.GetString(6);
+                    lastHttpStatus = r.IsDBNull(7) ? null : r.GetInt32(7);
+                    lastRowsInserted = r.IsDBNull(8) ? null : r.GetInt32(8);
+                    lastError = r.IsDBNull(9) ? null : r.GetString(9);
+
+                    lastOpenTime = r.IsDBNull(10) ? null : r.GetDateTime(10);
+                    lastInsertCreatedAt = r.IsDBNull(11) ? null : r.GetDateTime(11);
+
+                    nextInsertDueAt = r.IsDBNull(12) ? null : r.GetDateTime(12);
+                    computedPollSeconds = r.IsDBNull(13) ? null : r.GetInt32(13);
+                }
+            }
+        }
+        finally
+        {
+            await conn.CloseAsync();
+        }
+
+        // If we don't have a last_insert_created_at anchor in fetch_status, fallback to candles.created_at
+        if (!lastInsertCreatedAt.HasValue)
+        {
+            lastInsertCreatedAt = await _tradingDb.Candles
+                .AsNoTracking()
+                .Where(c => c.SymbolId == symbolEntity.Id && c.TimeframeId == timeframe.Id)
+                .OrderByDescending(c => c.CreatedAt)
+                .Select(c => (DateTime?)c.CreatedAt)
+                .FirstOrDefaultAsync();
+        }
+
+        // Provider that SHOULD be used now (market rule)
+        var providerShouldBe = DecideActiveProvider(nowUtc);
+
+        // Effective provider for scheduling -> prefer the worker-reported, else shouldBe
+        var effectiveProvider = NormalizeProvider(providerCurrent ?? providerShouldBe);
+
+        int intervalSec = ComputePollIntervalSeconds(effectiveProvider, nowUtc);
+        if (intervalSec < 1) intervalSec = 1;
+
+        var anchor = lastInsertCreatedAt ?? nowUtc;
+        var next = anchor.AddSeconds(intervalSec);
+
+        if (next <= nowUtc)
+        {
+            var deltaSec = (nowUtc - anchor).TotalSeconds;
+            var k = Math.Max(1, (int)Math.Ceiling(deltaSec / intervalSec));
+            next = anchor.AddSeconds(k * intervalSec);
+        }
+
+        var dto = new FetchStatusDto(
+            symbol: effectiveSymbol,
+            timeframeCode: effectiveTfCode,
+            timeframeMinutes: timeframe.Minutes,
+            providerCurrent: effectiveProvider,
+            providerShouldBe: providerShouldBe,
+            lastProviderChangeAt: lastProviderChangeAt,
+            workerName: workerName,
+            lastFetchStartedAt: lastFetchStartedAt,
+            lastFetchFinishedAt: lastFetchFinishedAt,
+            previousFetchFinishedAt: previousFetchFinishedAt,
+            lastFetchStatus: lastFetchStatus,
+            lastHttpStatus: lastHttpStatus,
+            lastRowsInserted: lastRowsInserted,
+            lastError: lastError,
+            lastOpenTime: lastOpenTime,
+            lastInsertCreatedAt: lastInsertCreatedAt,
+            nowUtc: nowUtc,
+            nextInsertUtc: next,
+            secondsUntilNext: (int)Math.Max(0, (next - nowUtc).TotalSeconds),
+            nextInsertDueAt: nextInsertDueAt,
+            computedPollSeconds: computedPollSeconds
+        );
+
+        return Ok(dto);
+    }
+
+    // -----------------------------------------------------------------------
+    // X.2) NEXT INSERT SCHEDULE (authoritative, created_at-anchored)
+    //       Uses fetch_status if present; otherwise falls back to candles.created_at.
+    // -----------------------------------------------------------------------
+
+    /**
+     * GET /api/trading/next-insert?symbol=NVDA&timeframeCode=1m
+     *
+     * - Chooses effective provider from fetch_status.provider_current if present;
+     *   otherwise market rule: TwelveData while open; Alpha when closed.
+     * - Anchors to fetch_status.last_insert_created_at if present; else last candles.created_at.
+     * - Computes next insert timestamps using provider cadence.
+     */
+    [HttpGet("~/api/trading/next-insert")]
+    public async Task<ActionResult<NextInsertScheduleDto>> GetNextInsertSchedule(
+        [FromQuery] string? symbol = null,
+        [FromQuery] string? timeframeCode = null)
+    {
+        var settingsGlobal = await EnsureSettingsRowAsync();
+
+        string effectiveSymbol = !string.IsNullOrWhiteSpace(symbol)
+            ? symbol.Trim().ToUpperInvariant()
+            : settingsGlobal.Symbol;
+
+        string effectiveTfCode = !string.IsNullOrWhiteSpace(timeframeCode)
+            ? timeframeCode.Trim()
+            : settingsGlobal.TimeframeCode;
+
+        // Resolve IDs
+        var symbolEntity = await _tradingDb.Symbols
+            .AsNoTracking()
+            .FirstOrDefaultAsync(s => s.Symbol == effectiveSymbol);
+
+        var timeframe = await _tradingDb.Timeframes
+            .AsNoTracking()
+            .FirstOrDefaultAsync(tf => tf.Code == effectiveTfCode);
+
+        if (symbolEntity == null || timeframe == null)
+            return NotFound("Unknown symbol/timeframe.");
+
+        var nowUtc = DateTime.UtcNow;
+
+        // Prefer fetch_status info if present
+        string? providerCurrent = null;
+        DateTime? lastInsertUtc = null;
+
+        var conn = _tradingDb.Database.GetDbConnection();
+        await conn.OpenAsync();
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+SELECT provider_current, last_insert_created_at
+FROM fetch_status
+WHERE symbol_id = @sid AND timeframe_id = @tid
+LIMIT 1;";
+            AddParam(cmd, "@sid", symbolEntity.Id);
+            AddParam(cmd, "@tid", timeframe.Id);
+
+            using var r = await cmd.ExecuteReaderAsync();
+            if (await r.ReadAsync())
+            {
+                providerCurrent = r.IsDBNull(0) ? null : NormalizeProvider(r.GetString(0));
+                lastInsertUtc = r.IsDBNull(1) ? null : r.GetDateTime(1);
+            }
+        }
+        finally
+        {
+            await conn.CloseAsync();
+        }
+
+        // If no anchor in fetch_status, use candles.created_at
+        if (!lastInsertUtc.HasValue)
+        {
+            lastInsertUtc = await _tradingDb.Candles
+                .AsNoTracking()
+                .Where(c => c.SymbolId == symbolEntity.Id && c.TimeframeId == timeframe.Id)
+                .OrderByDescending(c => c.CreatedAt)
+                .Select(c => (DateTime?)c.CreatedAt)
+                .FirstOrDefaultAsync();
+        }
+
+        var effectiveProvider = NormalizeProvider(providerCurrent ?? DecideActiveProvider(nowUtc));
+        int intervalSec = ComputePollIntervalSeconds(effectiveProvider, nowUtc);
+        if (intervalSec < 1) intervalSec = 1;
+
+        var anchor = lastInsertUtc ?? nowUtc;
+        var next = anchor.AddSeconds(intervalSec);
+
+        if (next <= nowUtc)
+        {
+            // Jump forward in whole intervals until the next is in the future (handles delays)
+            var deltaSec = (nowUtc - anchor).TotalSeconds;
+            var k = Math.Max(1, (int)Math.Ceiling(deltaSec / intervalSec));
+            next = anchor.AddSeconds(k * intervalSec);
+        }
+
+        var secondsUntil = (int)Math.Max(0, (next - nowUtc).TotalSeconds);
+
+        // Optionally persist an expectation into fetch_status so dashboards have a single source.
+        await UpsertFetchStatusExpectedAsync(
+            symbolId: symbolEntity.Id,
+            timeframeId: timeframe.Id,
+            provider: effectiveProvider,
+            nextInsertDueAt: next,
+            computedPollSeconds: intervalSec
+        );
+
+        var dto = new NextInsertScheduleDto(
+            effectiveSymbol,
+            effectiveTfCode,
+            effectiveProvider,
+            lastInsertUtc,
+            next,
+            secondsUntil
+        );
+
+        return Ok(dto);
+    }
+
+    // -----------------------------------------------------------------------
+    // X.3) WORKER HEARTBEAT (optional): lets workers POST their status directly
+    //       into fetch_status (single-row snapshot).
+    // -----------------------------------------------------------------------
+
+    public sealed record ProviderHeartbeatRequest(
+        string symbol,
+        string timeframeCode,
+        string provider,                   // 'twelvedata' | 'alpha'
+        string workerName,
+        string eventType,                  // 'fetch' | 'provider_change'
+        DateTime? fetchStartedUtc,
+        DateTime? fetchFinishedUtc,
+        string? resultStatus,              // 'ok'|'empty'|'rate_limited'|'error'
+        int? httpStatus,
+        int? rowsInserted,
+        string? errorMessage,
+        DateTime? lastOpenTimeUtc,
+        DateTime? lastInsertCreatedAtUtc
+    );
+
+    [HttpPost("~/api/trading/fetch-status/heartbeat")]
+    [Authorize(Roles = "Admin")] // or loosen if workers authenticate differently
+    public async Task<ActionResult> ProviderHeartbeat([FromBody] ProviderHeartbeatRequest req)
+    {
+        if (string.IsNullOrWhiteSpace(req.symbol) || string.IsNullOrWhiteSpace(req.timeframeCode))
+            return BadRequest("symbol and timeframeCode are required.");
+        if (string.IsNullOrWhiteSpace(req.provider) || string.IsNullOrWhiteSpace(req.workerName))
+            return BadRequest("provider and workerName are required.");
+
+        var providerNorm = NormalizeProvider(req.provider);
+        if (providerNorm is not ("twelvedata" or "alpha"))
+            return BadRequest("provider must be 'twelvedata' or 'alpha'.");
+
+        var symbol = req.symbol.Trim().ToUpperInvariant();
+        var tf = req.timeframeCode.Trim();
+
+        var symbolEntity = await _tradingDb.Symbols.AsNoTracking().FirstOrDefaultAsync(s => s.Symbol == symbol);
+        var timeframe = await _tradingDb.Timeframes.AsNoTracking().FirstOrDefaultAsync(t => t.Code == tf);
+        if (symbolEntity == null || timeframe == null)
+            return BadRequest("Unknown symbol/timeframe.");
+
+        // Detect provider change by reading current value
+        string? prevProvider = null;
+        DateTime? prevLastFetchFinished = null;
+
+        var conn = _tradingDb.Database.GetDbConnection();
+        await conn.OpenAsync();
+        try
+        {
+            using (var readCmd = conn.CreateCommand())
+            {
+                readCmd.CommandText = @"
+SELECT provider_current, last_fetch_finished_at
+FROM fetch_status
+WHERE symbol_id = @sid AND timeframe_id = @tid
+LIMIT 1;";
+                AddParam(readCmd, "@sid", symbolEntity.Id);
+                AddParam(readCmd, "@tid", timeframe.Id);
+
+                using var rr = await readCmd.ExecuteReaderAsync();
+                if (await rr.ReadAsync())
+                {
+                    prevProvider = rr.IsDBNull(0) ? null : NormalizeProvider(rr.GetString(0));
+                    prevLastFetchFinished = rr.IsDBNull(1) ? null : rr.GetDateTime(1);
+                }
+            }
+
+            bool providerChanged = prevProvider != null && prevProvider != providerNorm;
+            var providerChangeAt = providerChanged || (req.eventType?.ToLowerInvariant() == "provider_change")
+                ? DateTime.UtcNow
+                : (DateTime?)null;
+
+            using var upsert = conn.CreateCommand();
+            upsert.CommandText = @"
+INSERT INTO fetch_status
+(symbol_id, timeframe_id, provider_current, last_provider_change_at, worker_name,
+ last_fetch_started_at, last_fetch_finished_at, previous_fetch_finished_at,
+ last_fetch_status, last_http_status, last_rows_inserted, last_error,
+ last_open_time, last_insert_created_at, updated_at)
+VALUES
+(@sid, @tid, @prov, @prov_changed_at, @worker,
+ @start, @finish, @prev_finish,
+ @rstatus, @http, @rows, @err,
+ @open_time, @insert_created, UTC_TIMESTAMP())
+ON DUPLICATE KEY UPDATE
+  provider_current = VALUES(provider_current),
+  last_provider_change_at = IF(VALUES(last_provider_change_at) IS NOT NULL, VALUES(last_provider_change_at), last_provider_change_at),
+  worker_name = VALUES(worker_name),
+  previous_fetch_finished_at = IFNULL(last_fetch_finished_at, previous_fetch_finished_at),
+  last_fetch_started_at = VALUES(last_fetch_started_at),
+  last_fetch_finished_at = VALUES(last_fetch_finished_at),
+  last_fetch_status = VALUES(last_fetch_status),
+  last_http_status = VALUES(last_http_status),
+  last_rows_inserted = VALUES(last_rows_inserted),
+  last_error = VALUES(last_error),
+  last_open_time = VALUES(last_open_time),
+  last_insert_created_at = VALUES(last_insert_created_at),
+  updated_at = UTC_TIMESTAMP();";
+
+            AddParam(upsert, "@sid", symbolEntity.Id);
+            AddParam(upsert, "@tid", timeframe.Id);
+            AddParam(upsert, "@prov", providerNorm);
+            AddParam(upsert, "@prov_changed_at", providerChangeAt);
+            AddParam(upsert, "@worker", req.workerName.Trim());
+
+            AddParam(upsert, "@start", req.fetchStartedUtc);
+            AddParam(upsert, "@finish", req.fetchFinishedUtc);
+            AddParam(upsert, "@prev_finish", prevLastFetchFinished);
+
+            AddParam(upsert, "@rstatus", req.resultStatus);
+            AddParam(upsert, "@http", req.httpStatus);
+            AddParam(upsert, "@rows", req.rowsInserted);
+            AddParam(upsert, "@err", req.errorMessage);
+
+            AddParam(upsert, "@open_time", req.lastOpenTimeUtc);
+            AddParam(upsert, "@insert_created", req.lastInsertCreatedAtUtc);
+
+            await upsert.ExecuteNonQueryAsync();
+        }
+        finally
+        {
+            await conn.CloseAsync();
+        }
+
+        return NoContent();
+    }
+
+    // -----------------------------------------------------------------------
+    // X.4) Internal helpers for fetch_status writes
+    // -----------------------------------------------------------------------
+
+    private async Task UpsertFetchStatusExpectedAsync(
+        int symbolId, int timeframeId, string provider, DateTime nextInsertDueAt, int computedPollSeconds)
+    {
+        const string sql = @"
+INSERT INTO fetch_status
+(symbol_id, timeframe_id, provider_current, next_insert_due_at, computed_poll_seconds, updated_at)
+VALUES (@sid, @tid, @prov, @next_due, @poll, UTC_TIMESTAMP())
+ON DUPLICATE KEY UPDATE
+  provider_current = VALUES(provider_current),
+  next_insert_due_at = VALUES(next_insert_due_at),
+  computed_poll_seconds = VALUES(computed_poll_seconds),
+  updated_at = UTC_TIMESTAMP();";
+
+        var conn = _tradingDb.Database.GetDbConnection();
+        await conn.OpenAsync();
+        try
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            AddParam(cmd, "@sid", symbolId);
+            AddParam(cmd, "@tid", timeframeId);
+            AddParam(cmd, "@prov", NormalizeProvider(provider));
+            AddParam(cmd, "@next_due", nextInsertDueAt);
+            AddParam(cmd, "@poll", computedPollSeconds);
+            await cmd.ExecuteNonQueryAsync();
+        }
+        finally { await conn.CloseAsync(); }
+    }
+
+    private static void AddParam(IDbCommand c, string name, object? val)
+    {
+        var p = c.CreateParameter();
+        p.ParameterName = name;
+        p.Value = val ?? DBNull.Value;
+        c.Parameters.Add(p);
+    }
 }
