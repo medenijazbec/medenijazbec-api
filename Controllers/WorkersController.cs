@@ -45,25 +45,57 @@ public sealed class WorkersController : ControllerBase
 
     // ---------- DTOs ----------
 
+    // DTOs returned by /api/nvda-trading/workers
     public sealed class WorkerSummaryDto
     {
         public int Id { get; init; }
         public string Name { get; init; } = "";
         public string StrategyName { get; init; } = "";
         public string Mode { get; init; } = "";
+
         /// <summary>
         /// 1 = worker enabled / can be used; 0 = disabled (not shown in UI).
         /// </summary>
         public bool IsActive { get; init; }
+
         /// <summary>
         /// true = trading paused; false = trading allowed for this worker.
+        /// Backend maps isActive/isTradingPaused from DB.
         /// </summary>
         public bool IsTradingPaused { get; init; }
+
         public double InitialCapital { get; init; }
+
+        /// <summary>
+        /// Owner user id (string from Auth0 / identity provider) or null for admin-owned.
+        /// </summary>
         public string? OwnerUserId { get; init; }
+
+        /// <summary>
+        /// Latest equity snapshot from worker_stats, if any.
+        /// </summary>
         public double? LatestEquity { get; init; }
+
+        /// <summary>
+        /// Latest cash snapshot from worker_stats, if any.
+        /// </summary>
         public double? LatestCash { get; init; }
+
+        /// <summary>
+        /// When the latest worker_stats row was recorded (UTC).
+        /// </summary>
         public DateTime? LatestStatsAtUtc { get; init; }
+
+        /// <summary>
+        /// Win-rate percentage for this worker based on virtual trades
+        /// (only realized trades considered). Null if no trades.
+        /// </summary>
+        public double? SuccessRatePct { get; init; }
+
+        /// <summary>
+        /// Number of trades used to compute SuccessRatePct. Null if none.
+        /// </summary>
+        public int? TradesSampleCount { get; init; }
     }
 
     public sealed class UpdateWorkerModeRequest
@@ -104,9 +136,14 @@ public sealed class WorkersController : ControllerBase
         var filtered = FilterWorkersForCaller(baseQuery);
 
         var workers = await filtered.ToListAsync();
+        if (workers.Count == 0)
+            return Ok(Array.Empty<WorkerSummaryDto>());
+
         var workerIds = workers.Select(w => w.Id).ToArray();
 
+        // Latest stats per worker from worker_stats
         var latestStats = await _db.WorkerStats
+            .AsNoTracking()
             .Where(s => workerIds.Contains(s.WorkerId))
             .GroupBy(s => s.WorkerId)
             .Select(g => g.OrderByDescending(s => s.SnapshotUtc).First())
@@ -114,10 +151,42 @@ public sealed class WorkersController : ControllerBase
 
         var statsByWorker = latestStats.ToDictionary(x => x.WorkerId, x => x);
 
+        // NEW: aggregate virtual PnL stats per worker from Trades.
+        // Using a 90-day window; adjust if you want a longer history.
+        var since = DateTime.UtcNow.AddDays(-90);
+
+        var tradeAgg = await _db.Trades
+            .AsNoTracking()
+            .Where(t =>
+                workerIds.Contains(t.WorkerId) &&
+                t.TradeTimeUtc >= since &&
+                t.RealizedPnl.HasValue)
+            .GroupBy(t => t.WorkerId)
+            .Select(g => new
+            {
+                WorkerId = g.Key,
+                Total = g.Count(),
+                Wins = g.Count(t => t.RealizedPnl!.Value > 0d),
+            })
+            .ToListAsync();
+
+        var successByWorker = tradeAgg.ToDictionary(x => x.WorkerId, x => x);
+
         var result = workers
             .Select(w =>
             {
                 statsByWorker.TryGetValue(w.Id, out var st);
+                successByWorker.TryGetValue(w.Id, out var agg);
+
+                double? successRatePct = null;
+                int? tradesSampleCount = null;
+
+                if (agg != null && agg.Total > 0)
+                {
+                    tradesSampleCount = agg.Total;
+                    successRatePct = 100.0 * agg.Wins / agg.Total;
+                }
+
                 return new WorkerSummaryDto
                 {
                     Id = w.Id,
@@ -130,13 +199,16 @@ public sealed class WorkersController : ControllerBase
                     OwnerUserId = w.OwnerUserId,
                     LatestEquity = st?.Equity,
                     LatestCash = st?.Cash,
-                    LatestStatsAtUtc = st?.SnapshotUtc
+                    LatestStatsAtUtc = st?.SnapshotUtc,
+                    SuccessRatePct = successRatePct,
+                    TradesSampleCount = tradesSampleCount,
                 };
             })
             .ToArray();
 
         return Ok(result);
     }
+
 
     [HttpPut("{workerId:int}/mode")]
     public async Task<IActionResult> UpdateMode(int workerId, [FromBody] UpdateWorkerModeRequest req)
