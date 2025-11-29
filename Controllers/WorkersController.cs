@@ -1,0 +1,271 @@
+﻿// honey_badger_api/Controllers/WorkersController.cs
+using System;
+using System.Linq;
+using System.Security.Claims;
+using System.Threading.Tasks;
+using honey_badger_api.Data;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.EntityFrameworkCore;
+
+namespace honey_badger_api.Controllers;
+
+[ApiController]
+[Route("api/[controller]")]
+public sealed class WorkersController : ControllerBase
+{
+    private readonly NvdaTradingDbContext _db;
+
+    // All shared trading bots are "owned" by this admin Identity user.
+    private const string AdminOwnerId = "6a3c8fcb-d846-4028-ad28-0df42f57b7e8";
+
+    public WorkersController(NvdaTradingDbContext db)
+    {
+        _db = db;
+    }
+
+    // ---------- helpers ----------
+
+    private string? GetCurrentUserId()
+    {
+        return User.FindFirstValue(ClaimTypes.NameIdentifier)
+               ?? User.FindFirst("sub")?.Value;
+    }
+
+    private bool IsAdmin() =>
+        string.Equals(GetCurrentUserId(), AdminOwnerId, StringComparison.OrdinalIgnoreCase);
+
+    private IQueryable<NvdaTradingWorker> FilterWorkersForCaller(IQueryable<NvdaTradingWorker> query)
+    {
+        if (IsAdmin())
+            return query;
+
+        // normal users see admin-owned bots
+        return query.Where(w => w.OwnerUserId == AdminOwnerId);
+    }
+
+    // ---------- DTOs ----------
+
+    public sealed class WorkerSummaryDto
+    {
+        public int Id { get; init; }
+        public string Name { get; init; } = "";
+        public string StrategyName { get; init; } = "";
+        public string Mode { get; init; } = "";
+        /// <summary>
+        /// 1 = worker enabled / can be used; 0 = disabled (not shown in UI).
+        /// </summary>
+        public bool IsActive { get; init; }
+        /// <summary>
+        /// true = trading paused; false = trading allowed for this worker.
+        /// </summary>
+        public bool IsTradingPaused { get; init; }
+        public double InitialCapital { get; init; }
+        public string? OwnerUserId { get; init; }
+        public double? LatestEquity { get; init; }
+        public double? LatestCash { get; init; }
+        public DateTime? LatestStatsAtUtc { get; init; }
+    }
+
+    public sealed class UpdateWorkerModeRequest
+    {
+        /// <summary>"PAPER" or "LIVE"</summary>
+        public string Mode { get; init; } = "PAPER";
+    }
+
+    public sealed class UpdateWorkerActiveRequest
+    {
+        /// <summary>
+        /// true = trading active, false = trading paused, only for workers with IsActive = 1.
+        /// </summary>
+        public bool IsActive { get; init; }
+    }
+
+    public sealed class AllocateWorkerDailyRequest
+    {
+        /// <summary>Daily budget / capital allocated to this worker.</summary>
+        public double DailyCapital { get; init; }
+    }
+
+    public sealed class ResetWorkerDailyRequest
+    {
+        /// <summary>Optional new daily capital; if null, keep existing InitialCapital.</summary>
+        public double? NewDailyCapital { get; init; }
+
+        /// <summary>Optional note; stored in PauseReason and visible on Python side.</summary>
+        public string? ResetNote { get; init; }
+    }
+
+    // ---------- endpoints ----------
+
+    [HttpGet]
+    public async Task<ActionResult<WorkerSummaryDto[]>> GetWorkers()
+    {
+        var baseQuery = _db.Workers.AsNoTracking();
+        var filtered = FilterWorkersForCaller(baseQuery);
+
+        var workers = await filtered.ToListAsync();
+        var workerIds = workers.Select(w => w.Id).ToArray();
+
+        var latestStats = await _db.WorkerStats
+            .Where(s => workerIds.Contains(s.WorkerId))
+            .GroupBy(s => s.WorkerId)
+            .Select(g => g.OrderByDescending(s => s.SnapshotUtc).First())
+            .ToListAsync();
+
+        var statsByWorker = latestStats.ToDictionary(x => x.WorkerId, x => x);
+
+        var result = workers
+            .Select(w =>
+            {
+                statsByWorker.TryGetValue(w.Id, out var st);
+                return new WorkerSummaryDto
+                {
+                    Id = w.Id,
+                    Name = w.Name,
+                    StrategyName = w.StrategyName,
+                    Mode = w.Mode,
+                    IsActive = w.IsActive,
+                    IsTradingPaused = w.IsTradingPaused,
+                    InitialCapital = w.InitialCapital,
+                    OwnerUserId = w.OwnerUserId,
+                    LatestEquity = st?.Equity,
+                    LatestCash = st?.Cash,
+                    LatestStatsAtUtc = st?.SnapshotUtc
+                };
+            })
+            .ToArray();
+
+        return Ok(result);
+    }
+
+    [HttpPut("{workerId:int}/mode")]
+    public async Task<IActionResult> UpdateMode(int workerId, [FromBody] UpdateWorkerModeRequest req)
+    {
+        var modeUpper = (req.Mode ?? "").Trim().ToUpperInvariant();
+        if (modeUpper != "PAPER" && modeUpper != "LIVE")
+            return BadRequest("Mode must be 'PAPER' or 'LIVE'.");
+
+        var workerQuery = FilterWorkersForCaller(_db.Workers);
+        var worker = await workerQuery.FirstOrDefaultAsync(w => w.Id == workerId);
+        if (worker == null)
+            return NotFound();
+
+        worker.Mode = modeUpper;
+        worker.LastPauseAt = DateTime.UtcNow;
+        worker.PauseReason = $"Mode set to {modeUpper} via API at {DateTime.UtcNow:O}";
+
+        if (string.IsNullOrWhiteSpace(worker.OwnerUserId))
+            worker.OwnerUserId = AdminOwnerId;
+
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
+
+    [HttpPut("{workerId:int}/active")]
+    public async Task<IActionResult> UpdateActive(int workerId, [FromBody] UpdateWorkerActiveRequest req)
+    {
+        var workerQuery = FilterWorkersForCaller(_db.Workers);
+        var worker = await workerQuery.FirstOrDefaultAsync(w => w.Id == workerId);
+        if (worker == null)
+            return NotFound();
+
+        // IsActive = 0 means fully disabled and not in use; UI should not show those workers.
+        if (!worker.IsActive)
+            return BadRequest("Worker is disabled and cannot be started via this API.");
+
+        var tradingShouldBeActive = req.IsActive;
+
+        worker.IsTradingPaused = !tradingShouldBeActive;
+        worker.LastPauseAt = DateTime.UtcNow;
+        worker.PauseReason = tradingShouldBeActive ? "Unpaused via API" : "Paused via API";
+
+        if (string.IsNullOrWhiteSpace(worker.OwnerUserId))
+            worker.OwnerUserId = AdminOwnerId;
+
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
+
+    [HttpPut("{workerId:int}/daily-capital")]
+    public async Task<IActionResult> AllocateDailyCapital(
+        int workerId,
+        [FromBody] AllocateWorkerDailyRequest req)
+    {
+        if (req.DailyCapital <= 0)
+            return BadRequest("DailyCapital must be > 0.");
+
+        var workerQuery = FilterWorkersForCaller(_db.Workers);
+        var worker = await workerQuery.FirstOrDefaultAsync(w => w.Id == workerId);
+        if (worker == null)
+            return NotFound();
+
+        worker.InitialCapital = req.DailyCapital;
+        worker.PauseReason =
+            $"Daily capital set to {req.DailyCapital:F2} via API at {DateTime.UtcNow:O}";
+
+        if (string.IsNullOrWhiteSpace(worker.OwnerUserId))
+            worker.OwnerUserId = AdminOwnerId;
+
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
+
+    [HttpPost("{workerId:int}/reset-daily")]
+    public async Task<IActionResult> ResetDaily(
+        int workerId,
+        [FromBody] ResetWorkerDailyRequest req)
+    {
+        var workerQuery = FilterWorkersForCaller(_db.Workers);
+        var worker = await workerQuery.FirstOrDefaultAsync(w => w.Id == workerId);
+        if (worker == null)
+            return NotFound();
+
+        if (req.NewDailyCapital.HasValue)
+        {
+            if (req.NewDailyCapital.Value <= 0)
+                return BadRequest("NewDailyCapital must be > 0.");
+
+            worker.InitialCapital = req.NewDailyCapital.Value;
+        }
+
+        var latestStats = await _db.WorkerStats
+            .Where(s => s.WorkerId == workerId)
+            .OrderByDescending(s => s.SnapshotUtc)
+            .FirstOrDefaultAsync();
+
+        if (latestStats != null)
+        {
+            var snapshot = new NvdaTradingWorkerStats
+            {
+                WorkerId = workerId,
+                SnapshotUtc = DateTime.UtcNow,
+                Equity = latestStats.Equity,
+                Cash = latestStats.Cash,
+                UnrealizedPnl = 0,
+                RealizedPnl = latestStats.RealizedPnl,
+                OpenPositions = latestStats.OpenPositions,
+                TotalTrades = latestStats.TotalTrades,
+                GrossExposure = 0,
+                NetExposure = 0,
+                LongExposure = 0,
+                ShortExposure = 0,
+                DrawdownPct = 0,
+                MaxDrawdownPct = latestStats.MaxDrawdownPct,
+                DailyRealizedPnl = 0,
+                RollingSharpe30d = latestStats.RollingSharpe30d,
+                RollingSortino30d = latestStats.RollingSortino30d,
+                RiskFlagsJson = "[]"
+            };
+            await _db.WorkerStats.AddAsync(snapshot);
+        }
+
+        worker.PauseReason = req.ResetNote ?? $"Daily reset via API at {DateTime.UtcNow:O}";
+        worker.LastPauseAt = DateTime.UtcNow;
+
+        if (string.IsNullOrWhiteSpace(worker.OwnerUserId))
+            worker.OwnerUserId = AdminOwnerId;
+
+        await _db.SaveChangesAsync();
+        return NoContent();
+    }
+}
