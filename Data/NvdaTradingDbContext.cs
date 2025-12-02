@@ -573,6 +573,8 @@ public sealed class StrategySignal
 
     [Column("confidence")] public double? Confidence { get; set; }
 
+    [Column("analysis_minutes")] public int? AnalysisMinutes { get; set; }
+
     /// <summary>Status string: "NEW", "PENDING_USER", "ACCEPTED", "REJECTED", "EXPIRED", "CANCELLED".</summary>
     [Column("status")] public string Status { get; set; } = "";
 
@@ -617,6 +619,8 @@ public sealed class CouncilRecommendation
     [Column("expected_profit_value")] public double? ExpectedProfitValue { get; set; }
 
     [Column("confidence")] public double? Confidence { get; set; }
+
+    [Column("analysis_minutes")] public int? AnalysisMinutes { get; set; }
 
     [Column("signal_created_at")] public DateTime? SignalCreatedAt { get; set; }
 
