@@ -39,42 +39,132 @@ public sealed class NvdaTradingController : ControllerBase
         DateTime updatedUtc
     );
 
+    private static readonly (string Code, int Minutes)[] DefaultTimeframes =
+    {
+        ("1m", 1),
+        ("5m", 5),
+        ("10m", 10),
+        ("15m", 15),
+        ("25m", 25),
+        ("30m", 30),
+        ("45m", 45),
+        ("60m", 60),
+        ("75m", 75),
+        ("90m", 90)
+    };
+
+    private const string DefaultSymbol = "NVDA";
+    private const string DefaultProvider = "twelvedata";
+    private const double DefaultInitialCapital = 50.0;
+    private const int DefaultHistoricalCandles = 200;
+
+    /// <summary>
+    /// Capital source of truth comes from workers.initial_capital.
+    /// If no workers are active yet, fallback to DefaultInitialCapital.
+    /// </summary>
+    private async Task<double> GetWorkerCapitalDefaultAsync()
+    {
+        var avg = await _tradingDb.Workers
+            .AsNoTracking()
+            .Where(w => w.IsActive)
+            .Select(w => (double?)w.InitialCapital)
+            .AverageAsync();
+
+        if (avg.HasValue && avg.Value > 0)
+            return avg.Value;
+
+        return DefaultInitialCapital;
+    }
+
+    private async Task EnsureDefaultTimeframesAsync()
+    {
+        bool changed = false;
+        foreach (var tf in DefaultTimeframes)
+        {
+            var tfExists = await _tradingDb.Timeframes.AnyAsync(t => t.Code == tf.Code);
+            if (!tfExists)
+            {
+                _tradingDb.Timeframes.Add(new NvdaTradingTimeframe
+                {
+                    Code = tf.Code,
+                    Minutes = tf.Minutes
+                });
+                changed = true;
+            }
+        }
+
+        if (changed)
+            await _tradingDb.SaveChangesAsync();
+    }
+
+    private async Task EnsureDefaultTradingSettingsAsync()
+    {
+        var now = DateTime.UtcNow;
+        bool changed = false;
+        var workerCapital = await GetWorkerCapitalDefaultAsync();
+
+        foreach (var tf in DefaultTimeframes)
+        {
+            var exists = await _tradingDb.TradingSettings.AnyAsync(s =>
+                s.Symbol == DefaultSymbol &&
+                s.TimeframeCode == tf.Code);
+
+            if (exists) continue;
+
+            _tradingDb.TradingSettings.Add(new NvdaTradingSettings
+            {
+                Symbol = DefaultSymbol,
+                TimeframeCode = tf.Code,
+                TimeframeMinutes = tf.Minutes,
+                DataProvider = DefaultProvider,
+                InitialCapitalPerWorker = workerCapital,
+                HistoricalCandles = DefaultHistoricalCandles,
+                UpdatedUtc = now
+            });
+            changed = true;
+        }
+
+        if (changed)
+            await _tradingDb.SaveChangesAsync();
+    }
+
+    /// <summary>
+    /// Ensure a default trading_settings universe exists with multiple timeframes.
+    /// Returns the smallest-timeframe row as the "primary" setting for legacy callers.
+    /// </summary>
     private async Task<NvdaTradingSettings> EnsureSettingsRowAsync()
     {
-        // Single global row (Id = 1)
-        var settings = await _tradingDb.TradingSettings
+        await EnsureDefaultTimeframesAsync();
+        await EnsureDefaultTradingSettingsAsync();
+
+        // Prefer the smallest timeframe row for the default symbol; fall back to any row.
+        var primary = await _tradingDb.TradingSettings
             .AsTracking()
-            .FirstOrDefaultAsync(s => s.Id == 1);
+            .Where(s => s.Symbol == DefaultSymbol)
+            .OrderBy(s => s.TimeframeMinutes)
+            .FirstOrDefaultAsync();
 
-        if (settings != null) return settings;
+        if (primary != null) return primary;
 
-        settings = new NvdaTradingSettings
-        {
-            Id = 1,
-            Symbol = "NVDA",
-            TimeframeCode = "1m",
-            TimeframeMinutes = 1,
-            DataProvider = "alpha",
-            InitialCapitalPerWorker = 50.0,
-            HistoricalCandles = 200,
-            UpdatedUtc = DateTime.UtcNow
-        };
+        var fallback = await _tradingDb.TradingSettings
+            .AsTracking()
+            .OrderBy(s => s.TimeframeMinutes)
+            .FirstAsync();
 
-        _tradingDb.TradingSettings.Add(settings);
-        await _tradingDb.SaveChangesAsync();
-        return settings;
+        return fallback;
     }
 
     [HttpGet("settings")]
     public async Task<ActionResult<TradingSettingsDto>> GetSettings()
     {
         var s = await EnsureSettingsRowAsync();
+        var workerCapital = await GetWorkerCapitalDefaultAsync();
         return Ok(new TradingSettingsDto(
             s.Symbol,
             s.TimeframeCode,
             s.TimeframeMinutes,
             s.DataProvider,
-            s.InitialCapitalPerWorker,
+            workerCapital,
             s.HistoricalCandles,
             s.UpdatedUtc
         ));
@@ -104,20 +194,21 @@ public sealed class NvdaTradingController : ControllerBase
             return BadRequest("Symbol is required.");
         if (req.timeframeMinutes <= 0)
             return BadRequest("timeframeMinutes must be > 0.");
-        if (req.initialCapitalPerWorker <= 0)
-            return BadRequest("initialCapitalPerWorker must be > 0.");
         if (req.historicalCandles <= 0)
             return BadRequest("historicalCandles must be > 0.");
 
         var provider = (req.dataProvider ?? string.Empty).Trim().ToLowerInvariant();
-        if (provider is not ("alpha" or "finnhub" or "twelvedata"))
-            return BadRequest("dataProvider must be 'alpha', 'finnhub' or 'twelvedata'.");
+        if (provider is not ("alpha" or "finnhub" or "twelvedata" or "alpaca"))
+            return BadRequest("dataProvider must be 'alpha', 'finnhub', 'alpaca' or 'twelvedata'.");
+
+        var workerCapital = await GetWorkerCapitalDefaultAsync();
 
         s.Symbol = req.symbol.Trim().ToUpperInvariant();
         s.TimeframeCode = req.timeframeCode.Trim();
         s.TimeframeMinutes = req.timeframeMinutes;
         s.DataProvider = provider;
-        s.InitialCapitalPerWorker = req.initialCapitalPerWorker;
+        // Capital mirrors workers.initial_capital (single source of truth).
+        s.InitialCapitalPerWorker = workerCapital;
         s.HistoricalCandles = req.historicalCandles;
         s.UpdatedUtc = DateTime.UtcNow;
 
@@ -128,7 +219,7 @@ public sealed class NvdaTradingController : ControllerBase
             s.TimeframeCode,
             s.TimeframeMinutes,
             s.DataProvider,
-            s.InitialCapitalPerWorker,
+            workerCapital,
             s.HistoricalCandles,
             s.UpdatedUtc
         ));
@@ -208,8 +299,8 @@ public sealed class NvdaTradingController : ControllerBase
             return BadRequest("historicalCandles must be > 0.");
 
         var provider = (req.dataProvider ?? string.Empty).Trim().ToLowerInvariant();
-        if (provider is not ("alpha" or "finnhub" or "twelvedata"))
-            return BadRequest("dataProvider must be 'alpha', 'finnhub' or 'twelvedata'.");
+        if (provider is not ("alpha" or "finnhub" or "twelvedata" or "alpaca"))
+            return BadRequest("dataProvider must be 'alpha', 'finnhub', 'alpaca' or 'twelvedata'.");
 
         var symbol = req.symbol.Trim().ToUpperInvariant();
         var tfCode = req.timeframeCode.Trim();
@@ -227,13 +318,15 @@ public sealed class NvdaTradingController : ControllerBase
 
         var now = DateTime.UtcNow;
 
+        var workerCapital = await GetWorkerCapitalDefaultAsync();
+
         var entity = new NvdaTradingSettings
         {
             Symbol = symbol,
             TimeframeCode = tfCode,
             TimeframeMinutes = req.timeframeMinutes,
             DataProvider = provider,
-            InitialCapitalPerWorker = req.initialCapitalPerWorker,
+            InitialCapitalPerWorker = workerCapital,
             HistoricalCandles = req.historicalCandles,
             UpdatedUtc = now
         };

@@ -1,4 +1,4 @@
-﻿// honey_badger_api/Controllers/WorkersController.cs
+// honey_badger_api/Controllers/WorkersController.cs
 using System;
 using System.Linq;
 using System.Security.Claims;
@@ -96,6 +96,40 @@ public sealed class WorkersController : ControllerBase
         /// Number of trades used to compute SuccessRatePct. Null if none.
         /// </summary>
         public int? TradesSampleCount { get; init; }
+
+        /// <summary>
+        /// Which container currently owns this worker (from workers.runtime_instance_id).
+        /// </summary>
+        public string? RuntimeInstanceId { get; init; }
+
+        /// <summary>
+        /// Latest heartbeat timestamp from the worker container (UTC).
+        /// </summary>
+        public DateTime? LastHeartbeatAtUtc { get; init; }
+
+        /// <summary>
+        /// Per-timeframe win rates (sampled from trades.timeframe_id).
+        /// </summary>
+        public TimeframeWinRateDto[] TimeframeStats { get; init; } = Array.Empty<TimeframeWinRateDto>();
+
+        /// <summary>
+        /// Best-performing timeframe code (by win-rate) if available.
+        /// </summary>
+        public string? BestTimeframeCode { get; init; }
+
+        /// <summary>
+        /// Win rate for the best-performing timeframe (pct).
+        /// </summary>
+        public double? BestTimeframeSuccessRatePct { get; init; }
+    }
+
+    public sealed class TimeframeWinRateDto
+    {
+        public int TimeframeId { get; init; }
+        public string TimeframeCode { get; init; } = "";
+        public int TimeframeMinutes { get; init; }
+        public double? SuccessRatePct { get; init; }
+        public int? TradesSampleCount { get; init; }
     }
 
     public sealed class UpdateWorkerModeRequest
@@ -172,6 +206,29 @@ public sealed class WorkersController : ControllerBase
 
         var successByWorker = tradeAgg.ToDictionary(x => x.WorkerId, x => x);
 
+        // Per-timeframe win rates (from trades.timeframe_id)
+        var tfAgg = await _db.Trades
+            .AsNoTracking()
+            .Where(t =>
+                workerIds.Contains(t.WorkerId) &&
+                t.TradeTimeUtc >= since &&
+                t.RealizedPnl.HasValue &&
+                t.TimeframeId.HasValue)
+            .GroupBy(t => new { t.WorkerId, tfId = t.TimeframeId!.Value })
+            .Select(g => new
+            {
+                WorkerId = g.Key.WorkerId,
+                TimeframeId = g.Key.tfId,
+                Total = g.Count(),
+                Wins = g.Count(t => t.RealizedPnl!.Value > 0d)
+            })
+            .ToListAsync();
+
+        var timeframes = await _db.Timeframes.AsNoTracking().ToDictionaryAsync(tf => tf.Id);
+
+        // Helper lookup for per-worker per-timeframe aggregates
+        var tfAggLookup = tfAgg.ToLookup(x => (x.WorkerId, x.TimeframeId));
+
         var result = workers
             .Select(w =>
             {
@@ -185,6 +242,45 @@ public sealed class WorkersController : ControllerBase
                 {
                     tradesSampleCount = agg.Total;
                     successRatePct = 100.0 * agg.Wins / agg.Total;
+                }
+
+                var tfStats = timeframes
+                    .Values
+                    .OrderBy(tf => tf.Minutes)
+                    .Select(tf =>
+                    {
+                        var agg = tfAggLookup[(w.Id, tf.Id)].FirstOrDefault();
+                        double? sr = null;
+                        int? count = null;
+                        if (agg != null && agg.Total > 0)
+                        {
+                            sr = 100.0 * agg.Wins / agg.Total;
+                            count = agg.Total;
+                        }
+                        return new TimeframeWinRateDto
+                        {
+                            TimeframeId = tf.Id,
+                            TimeframeCode = tf.Code,
+                            TimeframeMinutes = tf.Minutes,
+                            SuccessRatePct = sr,
+                            TradesSampleCount = count
+                        };
+                    })
+                    .ToArray();
+
+                string? bestTfCode = null;
+                double? bestTfWin = null;
+                var tfWithTrades = tfStats
+                    .Where(t => t.TradesSampleCount.HasValue && t.TradesSampleCount.Value > 0)
+                    .ToArray();
+                if (tfWithTrades.Length > 0)
+                {
+                    var best = tfWithTrades
+                        .OrderByDescending(t => t.SuccessRatePct ?? 0)
+                        .ThenByDescending(t => t.TradesSampleCount ?? 0)
+                        .First();
+                    bestTfCode = best.TimeframeCode;
+                    bestTfWin = best.SuccessRatePct;
                 }
 
                 return new WorkerSummaryDto
@@ -202,10 +298,14 @@ public sealed class WorkersController : ControllerBase
                     LatestStatsAtUtc = st?.SnapshotUtc,
                     SuccessRatePct = successRatePct,
                     TradesSampleCount = tradesSampleCount,
+                    RuntimeInstanceId = w.RuntimeInstanceId,
+                    LastHeartbeatAtUtc = w.LastHeartbeatAt,
+                    TimeframeStats = tfStats,
+                    BestTimeframeCode = bestTfCode,
+                    BestTimeframeSuccessRatePct = bestTfWin
                 };
             })
             .ToArray();
-
         return Ok(result);
     }
 
