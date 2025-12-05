@@ -43,14 +43,76 @@ public sealed class WorkersController : ControllerBase
         return query.Where(w => w.OwnerUserId == AdminOwnerId);
     }
 
+    private async Task ResetWorkerStateAsync(int workerId, double baseCapital)
+    {
+        // Wipe all trading history for this worker and rebuild per-timeframe balances.
+        var recs = _db.CouncilRecommendations.Where(r => r.WorkerId == workerId);
+        _db.CouncilRecommendations.RemoveRange(recs);
+
+        var signals = _db.StrategySignals.Where(s => s.WorkerId == workerId);
+        _db.StrategySignals.RemoveRange(signals);
+
+        var trades = _db.Trades.Where(t => t.WorkerId == workerId);
+        _db.Trades.RemoveRange(trades);
+
+        var stats = _db.WorkerStats.Where(s => s.WorkerId == workerId);
+        _db.WorkerStats.RemoveRange(stats);
+
+        var balances = _db.WorkerTimeframeBalances.Where(b => b.WorkerId == workerId);
+        _db.WorkerTimeframeBalances.RemoveRange(balances);
+
+        var tfs = await _db.Timeframes.AsNoTracking().ToListAsync();
+        var now = DateTime.UtcNow;
+        foreach (var tf in tfs)
+        {
+            _db.WorkerTimeframeBalances.Add(new WorkerTimeframeBalance
+            {
+                WorkerId = workerId,
+                TimeframeId = tf.Id,
+                InitialCapital = baseCapital,
+                Cash = baseCapital,
+                RealizedPnl = 0,
+                UnrealizedPnl = 0,
+                Equity = baseCapital,
+                LastPrice = null,
+                CreatedAt = now,
+                UpdatedAt = now
+            });
+        }
+
+        // Seed a fresh stats snapshot so UI immediately reflects the reset.
+        var snapshot = new NvdaTradingWorkerStats
+        {
+            WorkerId = workerId,
+            SnapshotUtc = now,
+            Equity = baseCapital,
+            Cash = baseCapital,
+            UnrealizedPnl = 0,
+            RealizedPnl = 0,
+            OpenPositions = 0,
+            TotalTrades = 0,
+            GrossExposure = 0,
+            NetExposure = 0,
+            LongExposure = 0,
+            ShortExposure = 0,
+            DrawdownPct = 0,
+            MaxDrawdownPct = 0,
+            DailyRealizedPnl = 0,
+            RollingSharpe30d = null,
+            RollingSortino30d = null,
+            RiskFlagsJson = "[]"
+        };
+        await _db.WorkerStats.AddAsync(snapshot);
+    }
+
     // ---------- DTOs ----------
 
     // DTOs returned by /api/nvda-trading/workers
-    public sealed class WorkerSummaryDto
-    {
-        public int Id { get; init; }
-        public string Name { get; init; } = "";
-        public string StrategyName { get; init; } = "";
+        public sealed class WorkerSummaryDto
+        {
+            public int Id { get; init; }
+            public string Name { get; init; } = "";
+            public string StrategyName { get; init; } = "";
         public string Mode { get; init; } = "";
 
         /// <summary>
@@ -123,14 +185,17 @@ public sealed class WorkersController : ControllerBase
         public double? BestTimeframeSuccessRatePct { get; init; }
     }
 
-    public sealed class TimeframeWinRateDto
-    {
-        public int TimeframeId { get; init; }
-        public string TimeframeCode { get; init; } = "";
-        public int TimeframeMinutes { get; init; }
-        public double? SuccessRatePct { get; init; }
-        public int? TradesSampleCount { get; init; }
-    }
+        public sealed class TimeframeWinRateDto
+        {
+            public int TimeframeId { get; init; }
+            public string TimeframeCode { get; init; } = "";
+            public int TimeframeMinutes { get; init; }
+            public double? SuccessRatePct { get; init; }
+            public int? TradesSampleCount { get; init; }
+            public double? Equity { get; init; }
+            public double? Cash { get; init; }
+            public double? BaseCapital { get; init; }
+        }
 
     public sealed class UpdateWorkerModeRequest
     {
@@ -224,10 +289,17 @@ public sealed class WorkersController : ControllerBase
             })
             .ToListAsync();
 
+        // Per-timeframe balances are the source of truth for isolated capital
+        var tfBalances = await _db.WorkerTimeframeBalances
+            .AsNoTracking()
+            .Where(b => workerIds.Contains(b.WorkerId))
+            .ToListAsync();
+
         var timeframes = await _db.Timeframes.AsNoTracking().ToDictionaryAsync(tf => tf.Id);
 
         // Helper lookup for per-worker per-timeframe aggregates
         var tfAggLookup = tfAgg.ToLookup(x => (x.WorkerId, x.TimeframeId));
+        var tfBalLookup = tfBalances.ToLookup(x => (x.WorkerId, x.TimeframeId));
 
         var result = workers
             .Select(w =>
@@ -244,12 +316,22 @@ public sealed class WorkersController : ControllerBase
                     successRatePct = 100.0 * agg.Wins / agg.Total;
                 }
 
-                var tfStats = timeframes
-                    .Values
-                    .OrderBy(tf => tf.Minutes)
-                    .Select(tf =>
+                var tfIdsForWorker = tfBalances
+                    .Where(b => b.WorkerId == w.Id)
+                    .Select(b => b.TimeframeId)
+                    .Concat(timeframes.Values.Select(tf => tf.Id)) // ensure all TFs appear even if no balance yet
+                    .Distinct()
+                    .ToList();
+
+                var tfStats = tfIdsForWorker
+                    .Select(tfId =>
                     {
-                        var agg = tfAggLookup[(w.Id, tf.Id)].FirstOrDefault();
+                        if (!timeframes.TryGetValue(tfId, out var tf))
+                            return null;
+
+                        var agg = tfAggLookup[(w.Id, tfId)].FirstOrDefault();
+                        var bal = tfBalLookup[(w.Id, tfId)].FirstOrDefault();
+
                         double? sr = null;
                         int? count = null;
                         if (agg != null && agg.Total > 0)
@@ -257,15 +339,22 @@ public sealed class WorkersController : ControllerBase
                             sr = 100.0 * agg.Wins / agg.Total;
                             count = agg.Total;
                         }
+
                         return new TimeframeWinRateDto
                         {
                             TimeframeId = tf.Id,
                             TimeframeCode = tf.Code,
                             TimeframeMinutes = tf.Minutes,
                             SuccessRatePct = sr,
-                            TradesSampleCount = count
+                            TradesSampleCount = count,
+                            Equity = bal?.Equity,
+                            Cash = bal?.Cash,
+                            BaseCapital = bal?.InitialCapital ?? w.InitialCapital
                         };
                     })
+                    .Where(x => x != null)
+                    .OrderBy(x => x!.TimeframeMinutes)
+                    .Cast<TimeframeWinRateDto>()
                     .ToArray();
 
                 string? bestTfCode = null;
@@ -293,8 +382,8 @@ public sealed class WorkersController : ControllerBase
                     IsTradingPaused = w.IsTradingPaused,
                     InitialCapital = w.InitialCapital,
                     OwnerUserId = w.OwnerUserId,
-                    LatestEquity = st?.Equity,
-                    LatestCash = st?.Cash,
+                    LatestEquity = st?.Equity ?? w.InitialCapital,
+                    LatestCash = st?.Cash ?? w.InitialCapital,
                     LatestStatsAtUtc = st?.SnapshotUtc,
                     SuccessRatePct = successRatePct,
                     TradesSampleCount = tradesSampleCount,
@@ -378,6 +467,8 @@ public sealed class WorkersController : ControllerBase
         if (string.IsNullOrWhiteSpace(worker.OwnerUserId))
             worker.OwnerUserId = AdminOwnerId;
 
+        await ResetWorkerStateAsync(workerId, worker.InitialCapital);
+
         await _db.SaveChangesAsync();
         return NoContent();
     }
@@ -400,36 +491,7 @@ public sealed class WorkersController : ControllerBase
             worker.InitialCapital = req.NewDailyCapital.Value;
         }
 
-        var latestStats = await _db.WorkerStats
-            .Where(s => s.WorkerId == workerId)
-            .OrderByDescending(s => s.SnapshotUtc)
-            .FirstOrDefaultAsync();
-
-        if (latestStats != null)
-        {
-            var snapshot = new NvdaTradingWorkerStats
-            {
-                WorkerId = workerId,
-                SnapshotUtc = DateTime.UtcNow,
-                Equity = latestStats.Equity,
-                Cash = latestStats.Cash,
-                UnrealizedPnl = 0,
-                RealizedPnl = latestStats.RealizedPnl,
-                OpenPositions = latestStats.OpenPositions,
-                TotalTrades = latestStats.TotalTrades,
-                GrossExposure = 0,
-                NetExposure = 0,
-                LongExposure = 0,
-                ShortExposure = 0,
-                DrawdownPct = 0,
-                MaxDrawdownPct = latestStats.MaxDrawdownPct,
-                DailyRealizedPnl = 0,
-                RollingSharpe30d = latestStats.RollingSharpe30d,
-                RollingSortino30d = latestStats.RollingSortino30d,
-                RiskFlagsJson = "[]"
-            };
-            await _db.WorkerStats.AddAsync(snapshot);
-        }
+        await ResetWorkerStateAsync(workerId, worker.InitialCapital);
 
         worker.PauseReason = req.ResetNote ?? $"Daily reset via API at {DateTime.UtcNow:O}";
         worker.LastPauseAt = DateTime.UtcNow;

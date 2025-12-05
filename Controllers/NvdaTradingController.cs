@@ -24,6 +24,22 @@ public sealed class NvdaTradingController : ControllerBase
         _tradingDb = tradingDb;
     }
 
+    [HttpGet("timeframes")]
+    public async Task<ActionResult<object[]>> GetTimeframes()
+    {
+        var list = await _tradingDb.Timeframes
+            .AsNoTracking()
+            .OrderBy(tf => tf.Minutes)
+            .Select(tf => new
+            {
+                tf.Id,
+                tf.Code,
+                tf.Minutes
+            })
+            .ToListAsync();
+        return Ok(list);
+    }
+
     // -----------------------------------------------------------------------
     // 1) SETTINGS: SYMBOL / TIMEFRAME / PROVIDER / CAPITAL / HISTORY
     //    (single global row, Id=1)
@@ -39,18 +55,16 @@ public sealed class NvdaTradingController : ControllerBase
         DateTime updatedUtc
     );
 
+    // Supported TwelveData-compatible timeframes for our fetchers.
     private static readonly (string Code, int Minutes)[] DefaultTimeframes =
     {
         ("1m", 1),
         ("5m", 5),
-        ("10m", 10),
         ("15m", 15),
-        ("25m", 25),
         ("30m", 30),
         ("45m", 45),
-        ("60m", 60),
-        ("75m", 75),
-        ("90m", 90)
+        ("60m", 60),   // 1h
+        ("120m", 120), // 2h
     };
 
     private const string DefaultSymbol = "NVDA";

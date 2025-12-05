@@ -650,6 +650,22 @@ public sealed class CouncilRecommendation
     [Column("decision_note")] public string? DecisionNote { get; set; }
 }
 
+[Table("worker_timeframe_balances")]
+public sealed class WorkerTimeframeBalance
+{
+    [Key, Column("worker_id", Order = 0)] public int WorkerId { get; set; }
+    [Column("timeframe_id", Order = 1)] public int TimeframeId { get; set; }
+
+    [Column("initial_capital")] public double InitialCapital { get; set; }
+    [Column("cash")] public double Cash { get; set; }
+    [Column("realized_pnl")] public double RealizedPnl { get; set; }
+    [Column("unrealized_pnl")] public double UnrealizedPnl { get; set; }
+    [Column("equity")] public double Equity { get; set; }
+    [Column("last_price")] public double? LastPrice { get; set; }
+    [Column("created_at")] public DateTime CreatedAt { get; set; }
+    [Column("updated_at")] public DateTime UpdatedAt { get; set; }
+}
+
 #endregion
 
 // DTOs
@@ -698,6 +714,8 @@ public sealed class NvdaTradingDbContext : DbContext
     public DbSet<CandleFetchLease> CandleFetchLeases => Set<CandleFetchLease>();
     public DbSet<FetchEvent> FetchEvents => Set<FetchEvent>();
     public DbSet<FetchStatus> FetchStatuses => Set<FetchStatus>();
+
+    public DbSet<WorkerTimeframeBalance> WorkerTimeframeBalances => Set<WorkerTimeframeBalance>();
 
     public DbSet<Market> Markets => Set<Market>();
     public DbSet<MarketConstituent> MarketConstituents => Set<MarketConstituent>();
@@ -828,5 +846,9 @@ public sealed class NvdaTradingDbContext : DbContext
         // TOR workers
         b.Entity<TorWorker>()
             .HasIndex(x => x.ApiKeyId);
+
+        // Per-timeframe capital buckets
+        b.Entity<WorkerTimeframeBalance>()
+            .HasKey(x => new { x.WorkerId, x.TimeframeId });
     }
 }
